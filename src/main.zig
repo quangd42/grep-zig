@@ -21,18 +21,13 @@ pub fn main() !void {
         std.process.exit(1);
     }
 
-    // You can use print statements as follows for debugging, they'll be visible when running tests.
-    std.debug.print("Logs from your program will appear here!\n", .{});
-
-    // Uncomment this block to pass the first stage
-    //
-    // const pattern = args[2];
-    // var input_line: [1024]u8 = undefined;
-    // const input_len = try std.io.getStdIn().reader().read(&input_line);
-    // const input_slice = input_line[0..input_len];
-    // if (matchPattern(input_slice, pattern)) {
-    //     std.process.exit(0);
-    // } else {
-    //     std.process.exit(1);
-    // }
+    const pattern = args[2];
+    var input_line: [1024]u8 = undefined;
+    const input_len = try std.io.getStdIn().reader().read(&input_line);
+    const input_slice = input_line[0..input_len];
+    if (matchPattern(input_slice, pattern)) {
+        std.process.exit(0);
+    } else {
+        std.process.exit(1);
+    }
 }
