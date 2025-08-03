@@ -3,7 +3,7 @@ const mem = std.mem;
 const testing = std.testing;
 const ascii = std.ascii;
 
-fn matchPattern(input_line: []const u8, pattern: []const u8) bool {
+pub fn matchPattern(input_line: []const u8, pattern: []const u8) bool {
     if (pattern.len == 1) {
         return mem.indexOf(u8, input_line, pattern) != null;
     } else if (mem.startsWith(u8, pattern, "\\")) {
@@ -22,25 +22,18 @@ fn matchPattern(input_line: []const u8, pattern: []const u8) bool {
             },
             else => @panic("Unhandled pattern"),
         }
+    } else if (mem.startsWith(u8, pattern, "[")) {
+        var i: usize = 1;
+        while (pattern[i] != ']') : (i += 1) {}
+        for (input_line) |c| {
+            for (pattern[1..i]) |cand| {
+                if (c == cand) return true;
+            }
+        }
+        return false;
     } else {
         @panic("Unhandled pattern");
     }
-}
-
-test "002" {
-    const pattern = "\\d";
-    const input1 = "apple123";
-    const input2 = "apple";
-    try testing.expect(matchPattern(input1, pattern));
-    try testing.expect(!matchPattern(input2, pattern));
-}
-
-test "003" {
-    const pattern = "\\w";
-    const input1 = "alpha-num3ric";
-    const input2 = "$!?";
-    try testing.expect(matchPattern(input1, pattern));
-    try testing.expect(!matchPattern(input2, pattern));
 }
 
 pub fn main() !void {
