@@ -18,16 +18,24 @@ pub const Pattern = union(enum) {
     class: *const fn (u8) bool,
 };
 
+const Anchors = struct {
+    start: bool,
+    end: bool,
+};
+
 raw: []const u8,
+
 cursor: usize = 0,
 inst: std.ArrayList(Inst),
 patterns: std.ArrayList(Pattern),
+anchors: Anchors,
 
 pub fn init(gpa: Allocator, raw: []const u8) !Regex {
     var out = Regex{
         .raw = raw,
         .inst = .init(gpa),
         .patterns = .init(gpa),
+        .anchors = .{ .start = false, .end = false },
     };
     try out.compile();
     return out;
@@ -46,6 +54,14 @@ fn compile(p: *Regex) !void {
                 try p.escapedChar();
             },
             '[' => try p.charGroup(),
+            '^' => {
+                if (p.cursor != 0) return error.InvalidAnchor;
+                p.anchors.start = true;
+            },
+            '$' => {
+                if (p.cursor != p.raw.len - 1) return error.InvalidAnchor;
+                p.anchors.end = true;
+            },
             else => {
                 try p.inst.append(.{ .single_char = p.patterns.items.len });
                 try p.char();
@@ -154,14 +170,23 @@ pub fn matchAt(re: *Regex, idx: usize, full_input: []const u8) bool {
 }
 
 pub fn match(re: *Regex, input: []const u8) bool {
-    const max_i = input.len - re.inst.items.len + 1;
-    for (0..max_i) |i| {
+    var matched = false;
+    if (re.anchors.start) {
+        if (re.matchAt(0, input)) matched = true else return false;
+    }
+    const max_i = input.len - re.inst.items.len;
+    if (re.anchors.end) {
+        if (re.matchAt(max_i, input)) matched = true else return false;
+    }
+    if (matched) return true;
+
+    for (0..max_i + 1) |i| {
         if (re.matchAt(i, input)) return true;
     }
     return false;
 }
 
-test "matcher" {
+test "match char and escaped char" {
     const expect = testing.expect;
     const gpa = testing.allocator;
 
@@ -180,6 +205,11 @@ test "matcher" {
     try expect(re2.matchAt(4, input));
     try expect(!re2.matchAt(0, input));
     try expect(re2.match(input));
+}
+
+test "match character group" {
+    const expect = testing.expect;
+    const gpa = testing.allocator;
 
     const raw3 = "[1a] apple";
     const input3a = "1 apple";
@@ -198,4 +228,23 @@ test "matcher" {
     try expect(re4.match(input3c));
     try expect(!re4.match(input3a));
     try expect(!re4.match(input3b));
+}
+
+test "match anchors" {
+    const expect = testing.expect;
+    const gpa = testing.allocator;
+
+    const input1 = "logloglog";
+    const raw5 = "^log";
+    var re5 = try Regex.init(gpa, raw5);
+    defer re5.deinit();
+    const input5 = "log";
+    try expect(re5.match(input5));
+    try expect(re5.match(input1));
+
+    const raw1 = "log$";
+    var re1 = try Regex.init(gpa, raw1);
+    defer re1.deinit();
+    try expect(re1.match(input5));
+    try expect(re5.match(input1));
 }
