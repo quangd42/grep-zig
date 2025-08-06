@@ -76,6 +76,11 @@ fn compile(p: *Regex) !void {
                 if (p.cursor != p.raw.len - 1) return error.InvalidAnchor;
                 p.anchors.end = true;
             },
+            '.' => {
+                try p.inst.append(.{ .idx = p.patterns.items.len });
+                p.cursor += 1;
+                try p.patterns.append(.{ .class = &isAny });
+            },
             else => {
                 try p.inst.append(.{ .idx = p.patterns.items.len });
                 try p.char();
@@ -153,6 +158,10 @@ fn isDigit(c: u8) bool {
 
 fn isAlphanumeric(c: u8) bool {
     return c == '_' or ascii.isAlphanumeric(c);
+}
+
+fn isAny(_: u8) bool {
+    return true;
 }
 
 test "compile" {
@@ -313,4 +322,25 @@ test "quantifier" {
     defer re2.deinit();
     try expect(re2.match(input));
     try expect(re2.match(input2));
+}
+
+test "match wildcard" {
+    const expect = testing.expect;
+    const gpa = testing.allocator;
+
+    const input = "log";
+    const raw = "l.g";
+    var re = try Regex.init(gpa, raw);
+    defer re.deinit();
+    try expect(re.match(input));
+
+    const raw2 = ".og";
+    var re2 = try Regex.init(gpa, raw2);
+    defer re2.deinit();
+    try expect(re2.match(input));
+
+    const raw3 = "lo.";
+    var re3 = try Regex.init(gpa, raw3);
+    defer re3.deinit();
+    try expect(re3.match(input));
 }
