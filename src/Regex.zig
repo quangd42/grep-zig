@@ -4,23 +4,29 @@ const ascii = std.ascii;
 const testing = std.testing;
 const Regex = @This();
 
-pub const Inst = union(enum) {
-    single_char: usize,
-    class: struct {
-        idx: usize,
-        len: usize = 1,
-        negated: bool = false,
-    },
-    // quantifier: enum {
-    //     zero_or_more,
-    //     one_or_more,
-    //     zero_or_one,
-    // },
+pub const Inst = struct {
+    /// match the patterns at idx..idx+len
+    idx: usize,
+    len: usize = 1,
+    negated: bool = false,
+    quantifier: Quantifier = .{ .min = 1, .max = 1 },
+
+    const Quantifier = struct {
+        min: usize,
+        max: usize,
+    };
 };
 
 pub const Pattern = union(enum) {
     char: u8,
     class: *const fn (u8) bool,
+
+    pub fn match(p: Pattern, target: u8) bool {
+        return switch (p) {
+            .char => |c| c == target,
+            .class => |cl| cl(target),
+        };
+    }
 };
 
 const Anchors = struct {
@@ -55,7 +61,7 @@ fn compile(p: *Regex) !void {
     while (p.cursor < p.raw.len) : (p.cursor += 1) {
         switch (p.raw[p.cursor]) {
             '\\' => {
-                try p.inst.append(.{ .class = .{ .idx = p.patterns.items.len } });
+                try p.inst.append(.{ .idx = p.patterns.items.len });
                 try p.escapedChar();
             },
             '[' => try p.charGroup(),
@@ -72,7 +78,7 @@ fn compile(p: *Regex) !void {
             //     try p.inst.append(.{ .quantifier = .one_or_more });
             // },
             else => {
-                try p.inst.append(.{ .single_char = p.patterns.items.len });
+                try p.inst.append(.{ .idx = p.patterns.items.len });
                 try p.char();
             },
         }
@@ -106,7 +112,7 @@ fn charGroup(p: *Regex) !void {
     if (p.cursor >= p.raw.len) return error.UnfinishedClass;
     const negated = p.eatChar('^');
     const idx = p.patterns.items.len;
-    try p.inst.append(.{ .class = undefined });
+    try p.inst.append(.{ .idx = idx });
     const inst_idx = p.inst.items.len - 1;
     var len: usize = 0;
     while (p.raw[p.cursor] != ']') : (p.cursor += 1) {
@@ -117,7 +123,7 @@ fn charGroup(p: *Regex) !void {
         }
         len += 1;
     }
-    p.inst.items[inst_idx].class = .{
+    p.inst.items[inst_idx] = .{
         .idx = idx,
         .len = len,
         .negated = negated,
@@ -147,82 +153,52 @@ test "compile" {
     try testing.expect(patt.*[2].char == 'b');
 }
 
-pub fn matchAt(re: *Regex, idx: usize, full_input: []const u8) bool {
-    const input = full_input[idx..];
+fn matchInst(re: *Regex, inst: Inst, target: u8) bool {
+    for (re.patterns.items[inst.idx..][0..inst.len]) |pattern| {
+        if (pattern.match(target)) return !inst.negated;
+    }
+    return inst.negated;
+}
+
+pub fn matchAt2(re: *Regex, start_at: usize, full_input: []const u8) bool {
+    var input_idx = start_at;
     const instructions = re.inst.items;
-    const patterns = re.patterns.items;
-    if (instructions.len > input.len) return false;
-    main_loop: for (instructions, input[0..instructions.len]) |inst, target| {
-        switch (inst) {
-            .single_char => |p_idx| if (patterns[p_idx].char != target) return false,
-            .class => |data| {
-                if (!data.negated) {
-                    for (patterns[data.idx..][0..data.len]) |pattern| {
-                        switch (pattern) {
-                            .char => |p| if (p == target) continue :main_loop,
-                            .class => |p| if (p(target)) continue :main_loop,
-                        }
-                    }
-                    return false;
-                } else {
-                    for (patterns[data.idx..][0..data.len]) |pattern| {
-                        switch (pattern) {
-                            .char => |p| if (p == target) return false,
-                            .class => |p| if (p(target)) return false,
-                        }
-                    }
-                }
-            },
+    if (instructions.len > full_input.len - start_at) return false;
+    for (0..instructions.len) |i| {
+        const target = full_input[input_idx];
+        // const min = inst.quantifier.min;
+        // const max = inst.quantifier.max;
+        // var count: usize = 0;
+        if (re.matchInst(i, target)) {
+            input_idx += 1;
+            continue;
         }
+        return false;
     }
     return true;
 }
 
-pub fn matchAt2(re: *Regex, input: []const u8, instructions: []Inst) bool {
+pub fn matchAt(re: *Regex, input: []const u8, instructions: []Inst) bool {
     if (instructions.len == 0) {
         if (re.anchors.end and input.len != 0) return false;
         return true;
     }
     if (input.len == 0) return false;
 
-    const patterns = re.patterns.items;
     const target = input[0];
-    switch (instructions[0]) {
-        .single_char => |p_idx| {
-            if (patterns[p_idx].char == target)
-                return re.matchAt2(input[1..], instructions[1..]);
-            return false;
-        },
-        .class => |data| {
-            if (!data.negated) {
-                for (patterns[data.idx..][0..data.len]) |pattern| {
-                    switch (pattern) {
-                        .char => |p| {
-                            if (p == target) return re.matchAt2(input[1..], instructions[1..]);
-                        },
-                        .class => |p| if (p(target)) return re.matchAt2(input[1..], instructions[1..]),
-                    }
-                }
-            } else {
-                for (patterns[data.idx..][0..data.len]) |pattern| {
-                    switch (pattern) {
-                        .char => |p| if (p == target) return false,
-                        .class => |p| if (p(target)) return false,
-                    }
-                }
-                return re.matchAt2(input[1..], instructions[1..]);
-            }
-        },
+    const inst = instructions[0];
+    if (re.matchInst(inst, target)) {
+        return re.matchAt(input[1..], instructions[1..]);
     }
     return false;
 }
 
 pub fn match(re: *Regex, input: []const u8) bool {
     if (re.anchors.start)
-        return re.matchAt2(input, re.inst.items);
+        return re.matchAt(input, re.inst.items);
 
     for (0..input.len) |i| {
-        if (re.matchAt2(input[i..], re.inst.items)) return true;
+        if (re.matchAt(input[i..], re.inst.items)) return true;
     }
     return false;
 }
@@ -235,16 +211,11 @@ test "match char and escaped char" {
     const input = "0123abc";
     var re = try Regex.init(gpa, raw);
     defer re.deinit();
-    try expect(!re.matchAt(0, input));
-    try expect(re.matchAt(3, input));
-
     try expect(re.match(input));
 
     const raw2 = "\\wbc";
     var re2 = try Regex.init(gpa, raw2);
     defer re2.deinit();
-    try expect(re2.matchAt(4, input));
-    try expect(!re2.matchAt(0, input));
     try expect(re2.match(input));
 }
 
