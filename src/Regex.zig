@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ascii = std.ascii;
 const testing = std.testing;
+
 const Regex = @This();
 
 pub const Inst = struct {
@@ -35,6 +36,7 @@ const Anchors = struct {
 };
 
 raw: []const u8,
+input: []const u8 = &[_]u8{},
 
 cursor: usize = 0,
 inst: std.ArrayList(Inst),
@@ -63,6 +65,7 @@ fn compile(p: *Regex) !void {
             '\\' => {
                 try p.inst.append(.{ .idx = p.patterns.items.len });
                 try p.escapedChar();
+                p.quantifiers();
             },
             '[' => try p.charGroup(),
             '^' => {
@@ -73,13 +76,10 @@ fn compile(p: *Regex) !void {
                 if (p.cursor != p.raw.len - 1) return error.InvalidAnchor;
                 p.anchors.end = true;
             },
-            // '+' => {
-            //     if (p.cursor == 0) return error.InvalidQuantifier;
-            //     try p.inst.append(.{ .quantifier = .one_or_more });
-            // },
             else => {
                 try p.inst.append(.{ .idx = p.patterns.items.len });
                 try p.char();
+                p.quantifiers();
             },
         }
     }
@@ -107,6 +107,22 @@ fn escapedChar(p: *Regex) !void {
     });
 }
 
+// Only parsing one quantifier for now
+fn quantifiers(p: *Regex) void {
+    if (p.cursor + 1 >= p.raw.len) return;
+    var last_inst = &p.inst.items[p.inst.items.len - 1];
+    switch (p.raw[p.cursor + 1]) {
+        '+' => {
+            last_inst.quantifier = .{ .min = 1, .max = 0 };
+        },
+        '?' => {
+            last_inst.quantifier = .{ .min = 0, .max = 1 };
+        },
+        else => return,
+    }
+    p.cursor += 1;
+}
+
 fn charGroup(p: *Regex) !void {
     p.cursor += 1; // '['
     if (p.cursor >= p.raw.len) return error.UnfinishedClass;
@@ -128,6 +144,7 @@ fn charGroup(p: *Regex) !void {
         .len = len,
         .negated = negated,
     };
+    p.quantifiers();
 }
 
 fn isDigit(c: u8) bool {
@@ -160,16 +177,16 @@ fn matchInst(re: *Regex, inst: Inst, target: u8) bool {
     return inst.negated;
 }
 
-pub fn matchAt2(re: *Regex, start_at: usize, full_input: []const u8) bool {
+fn matchAt2(re: *Regex, start_at: usize) bool {
     var input_idx = start_at;
     const instructions = re.inst.items;
-    if (instructions.len > full_input.len - start_at) return false;
-    for (0..instructions.len) |i| {
-        const target = full_input[input_idx];
+    if (instructions.len > re.input.len - start_at) return false;
+    for (instructions) |inst| {
+        const target = re.input[input_idx];
         // const min = inst.quantifier.min;
         // const max = inst.quantifier.max;
         // var count: usize = 0;
-        if (re.matchInst(i, target)) {
+        if (re.matchInst(inst, target)) {
             input_idx += 1;
             continue;
         }
@@ -178,27 +195,41 @@ pub fn matchAt2(re: *Regex, start_at: usize, full_input: []const u8) bool {
     return true;
 }
 
-pub fn matchAt(re: *Regex, input: []const u8, instructions: []Inst) bool {
-    if (instructions.len == 0) {
-        if (re.anchors.end and input.len != 0) return false;
+fn matchAt(re: *Regex, input_i: usize, inst_i: usize) bool {
+    if (re.input.len == 0) return false;
+    if (inst_i >= re.inst.items.len) {
+        if (re.anchors.end and input_i < re.input.len) return false;
         return true;
     }
-    if (input.len == 0) return false;
+    if (input_i >= re.input.len) return false;
 
-    const target = input[0];
-    const inst = instructions[0];
+    const target = re.input[input_i];
+    const inst = re.inst.items[inst_i];
+    const min = inst.quantifier.min;
+    const max = inst.quantifier.max;
+    if (max == 0 and min == 1) {
+        if (re.matchInst(inst, target)) {
+            if (re.matchAt(input_i + 1, inst_i)) return true;
+            return re.matchAt(input_i + 1, inst_i + 1);
+        }
+    }
     if (re.matchInst(inst, target)) {
-        return re.matchAt(input[1..], instructions[1..]);
+        return re.matchAt(input_i + 1, inst_i + 1);
+    }
+    // this order means greedy match
+    if (min == 0) {
+        return re.matchAt(input_i, inst_i + 1);
     }
     return false;
 }
 
 pub fn match(re: *Regex, input: []const u8) bool {
+    re.input = input;
     if (re.anchors.start)
-        return re.matchAt(input, re.inst.items);
+        return re.matchAt(0, 0);
 
     for (0..input.len) |i| {
-        if (re.matchAt(input[i..], re.inst.items)) return true;
+        if (re.matchAt(i, 0)) return true;
     }
     return false;
 }
@@ -259,4 +290,27 @@ test "match anchors" {
     defer re6.deinit();
     try expect(re6.match(short));
     try expect(re5.match(long));
+}
+
+test "quantifier" {
+    const expect = testing.expect;
+    const gpa = testing.allocator;
+
+    const input = "cats";
+
+    const raw = "ca+ts";
+    const input1 = "caats";
+    var re = try Regex.init(gpa, raw);
+    defer re.deinit();
+    try expect(re.inst.items[1].quantifier.min == 1);
+    try expect(re.inst.items[1].quantifier.max == 0);
+    try expect(re.match(input));
+    try expect(re.match(input1));
+
+    const raw2 = "ca?ts";
+    const input2 = "cts";
+    var re2 = try Regex.init(gpa, raw2);
+    defer re2.deinit();
+    try expect(re2.match(input));
+    try expect(re2.match(input2));
 }
