@@ -330,9 +330,11 @@ test "match wildcard" {
 
     const input = "log";
     const raw = "l.g";
+    const input1 = "lot";
     var re = try Regex.init(gpa, raw);
     defer re.deinit();
     try expect(re.match(input));
+    try expect(!re.match(input1));
 
     const raw2 = ".og";
     var re2 = try Regex.init(gpa, raw2);
