@@ -78,8 +78,8 @@ fn compile(p: *Regex) !void {
             },
             '.' => {
                 try p.inst.append(.{ .idx = p.patterns.items.len });
-                p.cursor += 1;
                 try p.patterns.append(.{ .class = &isAny });
+                p.quantifiers();
             },
             else => {
                 try p.inst.append(.{ .idx = p.patterns.items.len });
