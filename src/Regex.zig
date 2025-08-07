@@ -2,32 +2,29 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ascii = std.ascii;
 const testing = std.testing;
+const assert = std.debug.assert;
 
 const Regex = @This();
 
 pub const Inst = struct {
     /// match the patterns at idx..idx+len
-    idx: usize,
-    len: usize = 1,
-    negated: bool = false,
-    quantifier: Quantifier = .{ .min = 1, .max = 1 },
+    op: Op,
+    next: usize,
+    alt: usize = 0,
 
-    const Quantifier = struct {
-        min: usize,
-        max: usize,
+    const Op = union(enum) {
+        char: u8,
+        class: *const fn (u8) bool,
+        nil,
+        end,
+
+        pub fn match(p: Op, target: u8) bool {
+            return switch (p) {
+                .char => |c| c == target,
+                .class => |cl| cl(target),
+            };
+        }
     };
-};
-
-pub const Pattern = union(enum) {
-    char: u8,
-    class: *const fn (u8) bool,
-
-    pub fn match(p: Pattern, target: u8) bool {
-        return switch (p) {
-            .char => |c| c == target,
-            .class => |cl| cl(target),
-        };
-    }
 };
 
 const Anchors = struct {
@@ -40,53 +37,60 @@ input: []const u8 = &[_]u8{},
 
 cursor: usize = 0,
 inst: std.ArrayList(Inst),
-patterns: std.ArrayList(Pattern),
 anchors: Anchors,
+
+const Error = error{ OutOfMemory, InvalidAnchor, UnfinishedClass, UnhandledClass };
 
 pub fn init(gpa: Allocator, raw: []const u8) !Regex {
     var out = Regex{
         .raw = raw,
         .inst = .init(gpa),
-        .patterns = .init(gpa),
         .anchors = .{ .start = false, .end = false },
     };
     try out.compile();
     return out;
 }
 
-pub fn deinit(p: *Regex) void {
-    p.inst.deinit();
-    p.patterns.deinit();
+pub fn deinit(re: *Regex) void {
+    re.inst.deinit();
 }
 
-fn compile(p: *Regex) !void {
-    while (p.cursor < p.raw.len) : (p.cursor += 1) {
-        switch (p.raw[p.cursor]) {
-            '\\' => {
-                try p.inst.append(.{ .idx = p.patterns.items.len });
-                try p.escapedChar();
-                p.quantifiers();
-            },
-            '[' => try p.charGroup(),
-            '^' => {
-                if (p.cursor != 0) return error.InvalidAnchor;
-                p.anchors.start = true;
-            },
-            '$' => {
-                if (p.cursor != p.raw.len - 1) return error.InvalidAnchor;
-                p.anchors.end = true;
-            },
-            '.' => {
-                try p.inst.append(.{ .idx = p.patterns.items.len });
-                try p.patterns.append(.{ .class = &isAny });
-                p.quantifiers();
-            },
-            else => {
-                try p.inst.append(.{ .idx = p.patterns.items.len });
-                try p.char();
-                p.quantifiers();
-            },
-        }
+fn compile(re: *Regex) !void {
+    // reserving first inst as nil
+    try re.inst.append(.{ .op = .nil, .next = 0 });
+
+    while (re.cursor < re.raw.len) {
+        try re.nextInst();
+    }
+
+    try re.inst.append(.{ .op = .end, .next = 0 });
+}
+
+fn nextInst(re: *Regex) Error!void {
+    if (re.cursor >= re.raw.len) return;
+    defer re.cursor += 1;
+
+    switch (re.raw[re.cursor]) {
+        '\\' => try re.escapedChar(),
+        '[' => try re.charGroup(),
+        '^' => {
+            if (re.cursor != 0) return error.InvalidAnchor;
+            re.anchors.start = true;
+        },
+        '$' => {
+            if (re.cursor != re.raw.len - 1) return error.InvalidAnchor;
+            re.anchors.end = true;
+        },
+        '.' => {
+            try re.inst.append(.{
+                .op = .{ .class = &isAny },
+                .next = re.inst.items.len + 1,
+            });
+        },
+        else => try re.inst.append(.{
+            .op = .{ .char = re.raw[re.cursor] },
+            .next = re.inst.items.len + 1,
+        }),
     }
 }
 
@@ -98,58 +102,57 @@ fn eatChar(p: *Regex, c: u8) bool {
     return false;
 }
 
-fn char(p: *Regex) !void {
-    try p.patterns.append(.{ .char = p.raw[p.cursor] });
-}
-
-fn escapedChar(p: *Regex) !void {
-    if (p.cursor + 1 >= p.raw.len) return error.UnfinishedClass;
-    p.cursor += 1;
-    try p.patterns.append(switch (p.raw[p.cursor]) {
-        'd' => .{ .class = &isDigit },
-        'w' => .{ .class = &isAlphanumeric },
+fn escapedChar(re: *Regex) !void {
+    if (re.cursor + 1 >= re.raw.len) return error.UnfinishedClass;
+    re.cursor += 1;
+    const next = re.inst.items.len + 1;
+    try re.inst.append(switch (re.raw[re.cursor]) {
+        'd' => .{ .op = .{ .class = &isDigit }, .next = next },
+        'w' => .{ .op = .{ .class = &isAlphanumeric }, .next = next },
         else => return error.UnhandledClass,
     });
 }
 
-// Only parsing one quantifier for now
-fn quantifiers(p: *Regex) void {
-    if (p.cursor + 1 >= p.raw.len) return;
-    var last_inst = &p.inst.items[p.inst.items.len - 1];
-    switch (p.raw[p.cursor + 1]) {
-        '+' => {
-            last_inst.quantifier = .{ .min = 1, .max = 0 };
-        },
-        '?' => {
-            last_inst.quantifier = .{ .min = 0, .max = 1 };
-        },
-        else => return,
-    }
-    p.cursor += 1;
-}
+fn charGroup(re: *Regex) !void {
+    re.cursor += 1; // '['
+    if (re.cursor >= re.raw.len) return error.UnfinishedClass;
+    const negated = re.eatChar('^');
+    const start = re.inst.items.len;
 
-fn charGroup(p: *Regex) !void {
-    p.cursor += 1; // '['
-    if (p.cursor >= p.raw.len) return error.UnfinishedClass;
-    const negated = p.eatChar('^');
-    const idx = p.patterns.items.len;
-    try p.inst.append(.{ .idx = idx });
-    const inst_idx = p.inst.items.len - 1;
-    var len: usize = 0;
-    while (p.raw[p.cursor] != ']') : (p.cursor += 1) {
-        if (p.cursor >= p.raw.len) return error.UnfinishedClass;
-        switch (p.raw[p.cursor]) {
-            '\\' => try p.escapedChar(),
-            else => try p.char(),
-        }
-        len += 1;
+    while (re.raw[re.cursor] != ']') {
+        if (re.cursor >= re.raw.len) return error.UnfinishedClass;
+        // for each candidate pattern, emit a jump
+        // jump.next = candidate pattern
+        // jump.alt = next split
+        // cand.next = group_next
+
+        try re.nextInst();
     }
-    p.inst.items[inst_idx] = .{
-        .idx = idx,
-        .len = len,
-        .negated = negated,
-    };
-    p.quantifiers();
+    const group_next = re.inst.items.len;
+    var i = start;
+    if (!negated) {
+        // patch each inst
+        while (i < group_next) : (i += 1) {
+            re.inst.items[i].next = group_next;
+            re.inst.items[i].alt = i + 1;
+        }
+        // for last inst of group, no more alt
+        re.inst.items[group_next - 1].alt = 0;
+    } else {
+        // if matched should return false, so next = 0
+        // if not matched (aka alt) try again with next inst, so alt should be i + 1
+        while (i < group_next) : (i += 1) {
+            re.inst.items[i].next = 0;
+            re.inst.items[i].alt = i + 1;
+        }
+        // at last inst, if not matched then char group is over
+        // add inst that consume current input char (which last inst is pointing to)
+        try re.inst.append(.{
+            .op = .{ .class = &isAny },
+            .next = group_next + 1,
+            .alt = 0,
+        });
+    }
 }
 
 fn isDigit(c: u8) bool {
@@ -166,17 +169,17 @@ fn isAny(_: u8) bool {
 
 test "compile" {
     const gpa = testing.allocator;
-    var p = try Regex.init(gpa, "\\dab[\\dab]");
-    defer p.deinit();
-    const inst = &p.inst.items;
-    const patt = &p.patterns.items;
+    var re = try Regex.init(gpa, "\\dab[\\dab]");
+    defer re.deinit();
+    const inst = re.inst.items;
 
-    try testing.expect(inst.len == 4);
+    try testing.expectEqual(6, re.inst.items.len - 2);
+    try testing.expect(inst[0].op.nil == {});
+    try testing.expect(inst[re.inst.items.len - 1].op.end == {});
 
-    try testing.expect(patt.len == 6);
-    try testing.expect(patt.*[0].class == &isDigit);
-    try testing.expect(patt.*[1].char == 'a');
-    try testing.expect(patt.*[2].char == 'b');
+    try testing.expect(inst[1].op.class == &isDigit);
+    try testing.expect(inst[2].op.char == 'a');
+    try testing.expect(inst[3].op.char == 'b');
 }
 
 fn matchInst(re: *Regex, inst: Inst, target: u8) bool {
@@ -186,59 +189,45 @@ fn matchInst(re: *Regex, inst: Inst, target: u8) bool {
     return inst.negated;
 }
 
-fn matchAt2(re: *Regex, start_at: usize) bool {
-    var input_idx = start_at;
-    const instructions = re.inst.items;
-    if (instructions.len > re.input.len - start_at) return false;
-    for (instructions) |inst| {
-        const target = re.input[input_idx];
-        // const min = inst.quantifier.min;
-        // const max = inst.quantifier.max;
-        // var count: usize = 0;
-        if (re.matchInst(inst, target)) {
-            input_idx += 1;
-            continue;
-        }
-        return false;
-    }
-    return true;
-}
+fn matchAt(re: *Regex, input_idx: usize, inst_idx: usize) bool {
+    if (re.inst.items.len == 0) return true; // nothing to match
+    assert(inst_idx < re.inst.items.len); // all inst should never point past op.end
 
-fn matchAt(re: *Regex, input_i: usize, inst_i: usize) bool {
-    if (re.input.len == 0) return false;
-    if (inst_i >= re.inst.items.len) {
-        if (re.anchors.end and input_i < re.input.len) return false;
-        return true;
-    }
-    if (input_i >= re.input.len) return false;
+    // if (input_idx < re.input.len) std.debug.print("input_idx = {d}, char = {c}, inst_idx = {d}, inst = {any}\n", .{ input_idx, re.input[input_idx], inst_idx, re.inst.items[inst_idx] });
 
-    const target = re.input[input_i];
-    const inst = re.inst.items[inst_i];
-    const min = inst.quantifier.min;
-    const max = inst.quantifier.max;
-    if (max == 0 and min == 1) {
-        if (re.matchInst(inst, target)) {
-            if (re.matchAt(input_i + 1, inst_i)) return true;
-            return re.matchAt(input_i + 1, inst_i + 1);
-        }
-    }
-    if (re.matchInst(inst, target)) {
-        return re.matchAt(input_i + 1, inst_i + 1);
-    }
-    // this order means greedy match
-    if (min == 0) {
-        return re.matchAt(input_i, inst_i + 1);
-    }
-    return false;
+    const inst = re.inst.items[inst_idx];
+    return switch (inst.op) {
+        .nil => return false,
+        .end => {
+            // Found a path to the end state.
+            // return input_idx >= re.input.len; ???
+            if (re.anchors.end and input_idx != re.input.len) return false;
+            return true;
+        },
+        .char => |c| {
+            if (input_idx >= re.input.len) return false; // not enough input to match pattern
+            if (re.input[input_idx] == c) {
+                return re.matchAt(input_idx + 1, inst.next);
+            }
+            return re.matchAt(input_idx, inst.alt);
+        },
+        .class => |cl| {
+            if (input_idx >= re.input.len) return false; // not enough input to match pattern
+            if (cl(re.input[input_idx])) {
+                return re.matchAt(input_idx + 1, inst.next);
+            }
+            return re.matchAt(input_idx, inst.alt);
+        },
+    };
 }
 
 pub fn match(re: *Regex, input: []const u8) bool {
     re.input = input;
     if (re.anchors.start)
-        return re.matchAt(0, 0);
+        return re.matchAt(0, 1);
 
     for (0..input.len) |i| {
-        if (re.matchAt(i, 0)) return true;
+        if (re.matchAt(i, 1)) return true;
     }
     return false;
 }
@@ -269,7 +258,6 @@ test "match character group" {
     const input3c = "b apple";
     var re3 = try Regex.init(gpa, raw3);
     defer re3.deinit();
-    try expect(re3.patterns.items.len == 8);
     try expect(re3.match(input3a));
     try expect(re3.match(input3b));
     try expect(!re3.match(input3c));
@@ -301,28 +289,28 @@ test "match anchors" {
     try expect(re5.match(long));
 }
 
-test "quantifier" {
-    const expect = testing.expect;
-    const gpa = testing.allocator;
-
-    const input = "cats";
-
-    const raw = "ca+ts";
-    const input1 = "caats";
-    var re = try Regex.init(gpa, raw);
-    defer re.deinit();
-    try expect(re.inst.items[1].quantifier.min == 1);
-    try expect(re.inst.items[1].quantifier.max == 0);
-    try expect(re.match(input));
-    try expect(re.match(input1));
-
-    const raw2 = "ca?ts";
-    const input2 = "cts";
-    var re2 = try Regex.init(gpa, raw2);
-    defer re2.deinit();
-    try expect(re2.match(input));
-    try expect(re2.match(input2));
-}
+// test "quantifier" {
+//     const expect = testing.expect;
+//     const gpa = testing.allocator;
+//
+//     const input = "cats";
+//
+//     const raw = "ca+ts";
+//     const input1 = "caats";
+//     var re = try Regex.init(gpa, raw);
+//     defer re.deinit();
+//     try expect(re.inst.items[1].quantifier.min == 1);
+//     try expect(re.inst.items[1].quantifier.max == 0);
+//     try expect(re.match(input));
+//     try expect(re.match(input1));
+//
+//     const raw2 = "ca?ts";
+//     const input2 = "cts";
+//     var re2 = try Regex.init(gpa, raw2);
+//     defer re2.deinit();
+//     try expect(re2.match(input));
+//     try expect(re2.match(input2));
+// }
 
 test "match wildcard" {
     const expect = testing.expect;
@@ -346,3 +334,26 @@ test "match wildcard" {
     defer re3.deinit();
     try expect(re3.match(input));
 }
+
+// test "match groups with alternation" {
+//     const expect = testing.expect;
+//     const gpa = testing.allocator;
+//
+//     const raw = "(abl|cde)123";
+//     var re = try Regex.init(gpa, raw);
+//     defer re.deinit();
+//
+//     try expect(re.match("abl123"));
+//     try expect(re.match("cde123"));
+//     try expect(!re.match("abc123"));
+//     try expect(!re.match("xyz123"));
+//
+//     const raw2 = "x(a|b|c)y";
+//     var re2 = try Regex.init(gpa, raw2);
+//     defer re2.deinit();
+//
+//     try expect(re2.match("xay"));
+//     try expect(re2.match("xby"));
+//     try expect(re2.match("xcy"));
+//     try expect(!re2.match("xdy"));
+// }
