@@ -339,12 +339,11 @@ fn matchAt(re: *Regex, input_idx: usize, inst_idx: usize, state: *MatchState) !b
             while (state.items.len <= group_num) {
                 state.appendAssumeCapacity(.{});
             }
-            assert(group_num == state.items.len - 1);
             state.items[group_num].start = input_idx;
             return try re.matchAt(input_idx, inst.next, state);
         },
         .group_end => |group_num| {
-            assert(group_num == state.items.len - 1);
+            assert(group_num < state.items.len);
             state.items[group_num].end = input_idx;
             return try re.matchAt(input_idx, inst.next, state);
         },
@@ -527,4 +526,10 @@ test "backreference" {
 
     try expect(re2.match("3 red squares and 3 red circles"));
     try expect(!re2.match("3 red squares and 4 red circles"));
+
+    const raw3 = "^I see (\\d (cat|dog|cow)s?(, | and )?)+$";
+    var re3 = try Regex.init(gpa, raw3);
+    defer re3.deinit();
+
+    try expect(re3.match("I see 1 cat, 2 dogs and 3 cows"));
 }
