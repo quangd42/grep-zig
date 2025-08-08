@@ -64,7 +64,7 @@ fn compile(re: *Regex) !void {
         re.cursor += 1;
     }
 
-    try re.parseConcat();
+    try re.parseAlternation();
 
     try re.inst.append(.{ .op = .end, .next = 0 });
 }
@@ -162,6 +162,10 @@ fn parseAtom(re: *Regex) Error!void {
                 re.anchors.end = true;
             } else return error.UnsupportedClass;
         },
+        '(' => {
+            re.next(); // '('
+            try re.parseAlternation();
+        },
         else => try re.inst.append(.{
             .op = .{ .char = re.peek() },
             .next = re.inst.items.len + 1,
@@ -204,6 +208,7 @@ fn parseRepetition(re: *Regex) !void {
 
 fn parseConcat(re: *Regex) !void {
     while (re.cursor < re.raw.len) {
+        if (re.peek() == '|' or re.peek() == ')') return;
         try re.parseRepetition();
     }
 }
@@ -214,16 +219,26 @@ test "compile" {
     defer re.deinit();
     const inst = re.inst.items;
 
-    // for (re.inst.items, 0..) |in, i| {
-    //     std.debug.print("{d:<2} {any}\n", .{ i, in });
-    // }
-    try testing.expectEqual(6, re.inst.items.len - 2);
+    try testing.expectEqual(7, re.inst.items.len - 2);
     try testing.expect(inst[0].op.nil == {});
     try testing.expect(inst[re.inst.items.len - 1].op.end == {});
 
-    try testing.expect(inst[1].op.class == &isDigit);
-    try testing.expect(inst[2].op.char == 'a');
-    try testing.expect(inst[3].op.char == 'b');
+    try testing.expect(inst[2].op.class == &isDigit);
+    try testing.expect(inst[3].op.char == 'a');
+    try testing.expect(inst[4].op.char == 'b');
+}
+
+fn parseAlternation(re: *Regex) !void {
+    const split_idx = re.inst.items.len;
+    try re.split(split_idx + 1, 0); // alt to be patched
+    try re.parseConcat();
+    if (re.cursor < re.raw.len and re.peek() == '|') {
+        re.inst.items[split_idx].alt = re.inst.items.len;
+        re.next();
+        const last_alt = re.inst.items.len - 1;
+        try re.parseAlternation();
+        re.inst.items[last_alt].next = re.inst.items.len;
+    }
 }
 
 fn matchInst(re: *Regex, inst: Inst, target: u8) bool {
@@ -380,25 +395,29 @@ test "match wildcard" {
     try expect(re3.match(input));
 }
 
-// test "match groups with alternation" {
-//     const expect = testing.expect;
-//     const gpa = testing.allocator;
-//
-//     const raw = "(abl|cde)123";
-//     var re = try Regex.init(gpa, raw);
-//     defer re.deinit();
-//
-//     try expect(re.match("abl123"));
-//     try expect(re.match("cde123"));
-//     try expect(!re.match("abc123"));
-//     try expect(!re.match("xyz123"));
-//
-//     const raw2 = "x(a|b|c)y";
-//     var re2 = try Regex.init(gpa, raw2);
-//     defer re2.deinit();
-//
-//     try expect(re2.match("xay"));
-//     try expect(re2.match("xby"));
-//     try expect(re2.match("xcy"));
-//     try expect(!re2.match("xdy"));
-// }
+test "match groups with alternation" {
+    const expect = testing.expect;
+    const gpa = testing.allocator;
+
+    const raw = "(abl|cde)+123";
+    var re = try Regex.init(gpa, raw);
+    defer re.deinit();
+
+    // for (re.inst.items, 0..) |in, i| {
+    //     std.debug.print("{d:>2} {any}\n", .{ i, in });
+    // }
+    try expect(re.match("abl123"));
+    try expect(re.match("cde123"));
+    try expect(re.match("ablcde123"));
+    try expect(!re.match("abc123"));
+    try expect(!re.match("xyz123"));
+
+    const raw2 = "x(a|b|c)y";
+    var re2 = try Regex.init(gpa, raw2);
+    defer re2.deinit();
+
+    try expect(re2.match("xay"));
+    try expect(re2.match("xby"));
+    try expect(re2.match("xcy"));
+    try expect(!re2.match("xdy"));
+}
