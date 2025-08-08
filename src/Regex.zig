@@ -58,48 +58,23 @@ pub fn deinit(re: *Regex) void {
 fn compile(re: *Regex) !void {
     // reserving first inst as nil
     try re.inst.append(.{ .op = .nil, .next = 0 });
-
-    while (re.cursor < re.raw.len) {
-        try re.nextInst();
+    if (re.raw[re.cursor] == '^') {
+        re.anchors.start = true;
+        re.cursor += 1;
     }
 
+    while (re.cursor < re.raw.len) {
+        try re.parseAtom();
+    }
+
+    if (re.cursor < re.raw.len and re.raw[re.cursor] == '$') {
+        re.anchors.end = true;
+    }
     try re.inst.append(.{ .op = .end, .next = 0 });
 }
 
-fn nextInst(re: *Regex) Error!void {
-    if (re.cursor >= re.raw.len) return;
-    defer re.cursor += 1;
-
-    switch (re.raw[re.cursor]) {
-        '\\' => try re.escapedChar(),
-        '[' => try re.charGroup(),
-        '^' => {
-            if (re.cursor != 0) return error.InvalidAnchor;
-            re.anchors.start = true;
-        },
-        '$' => {
-            if (re.cursor != re.raw.len - 1) return error.InvalidAnchor;
-            re.anchors.end = true;
-        },
-        '.' => {
-            try re.inst.append(.{
-                .op = .{ .class = &isAny },
-                .next = re.inst.items.len + 1,
-            });
-        },
-        else => try re.inst.append(.{
-            .op = .{ .char = re.raw[re.cursor] },
-            .next = re.inst.items.len + 1,
-        }),
-    }
-}
-
-fn eatChar(p: *Regex, c: u8) bool {
-    if (p.raw[p.cursor] == c) {
-        p.cursor += 1;
-        return true;
-    }
-    return false;
+fn peek(re: *Regex) u8 {
+    return re.raw[re.cursor];
 }
 
 fn escapedChar(re: *Regex) !void {
@@ -116,7 +91,8 @@ fn escapedChar(re: *Regex) !void {
 fn charGroup(re: *Regex) !void {
     re.cursor += 1; // '['
     if (re.cursor >= re.raw.len) return error.UnfinishedClass;
-    const negated = re.eatChar('^');
+    const negated = re.peek() == '^';
+    if (negated) re.cursor += 1;
     const start = re.inst.items.len;
 
     while (re.raw[re.cursor] != ']') {
@@ -126,7 +102,7 @@ fn charGroup(re: *Regex) !void {
         // jump.alt = next split
         // cand.next = group_next
 
-        try re.nextInst();
+        try re.parseAtom();
     }
     const group_next = re.inst.items.len;
     var i = start;
@@ -165,6 +141,26 @@ fn isAlphanumeric(c: u8) bool {
 
 fn isAny(_: u8) bool {
     return true;
+}
+
+fn parseAtom(re: *Regex) Error!void {
+    if (re.cursor >= re.raw.len) return;
+    defer re.cursor += 1;
+
+    switch (re.raw[re.cursor]) {
+        '\\' => try re.escapedChar(),
+        '[' => try re.charGroup(),
+        '.' => {
+            try re.inst.append(.{
+                .op = .{ .class = &isAny },
+                .next = re.inst.items.len + 1,
+            });
+        },
+        else => try re.inst.append(.{
+            .op = .{ .char = re.raw[re.cursor] },
+            .next = re.inst.items.len + 1,
+        }),
+    }
 }
 
 test "compile" {
