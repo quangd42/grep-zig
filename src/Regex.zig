@@ -18,14 +18,31 @@ pub const Inst = struct {
         nil,
         end,
         split,
-
-        pub fn match(p: Op, target: u8) bool {
-            return switch (p) {
-                .char => |c| c == target,
-                .class => |cl| cl(target),
-            };
-        }
+        // group number of the capture text
+        group_start: usize,
+        group_end: usize,
+        // group number to reference
+        backref: usize,
     };
+
+    pub fn format(
+        self: @This(),
+        comptime _: []const u8,
+        _: std.fmt.FormatOptions,
+        writer: anytype,
+    ) !void {
+        switch (self.op) {
+            .char => |c| try writer.print("char = '{c}'    ", .{c}),
+            .class => |cl| try writer.print("class = {*}", .{cl}),
+            .nil => try writer.print("nil           ", .{}),
+            .split => try writer.print("split         ", .{}),
+            .end => try writer.print("end           ", .{}),
+            .group_start => |g| try writer.print("grp_start = {d:<2}", .{g}),
+            .group_end => |g| try writer.print("grp_end = {d:<2}  ", .{g}),
+            .backref => |g| try writer.print("backref = {d:<2}  ", .{g}),
+        }
+        try writer.print(", next = {d:<4}, alt = {d:<4}", .{ self.next, self.alt });
+    }
 };
 
 const Anchors = struct {
@@ -35,18 +52,21 @@ const Anchors = struct {
 
 raw: []const u8,
 input: []const u8 = &[_]u8{},
+allocator: Allocator,
 
 cursor: usize = 0,
 inst: std.ArrayList(Inst),
 anchors: Anchors,
+group_count: usize = 0,
 
-const Error = error{ OutOfMemory, UnexpectedEOF, UnsupportedClass };
+const Error = error{ OutOfMemory, UnexpectedEOF, UnsupportedClass, InvalidBackReference };
 
 pub fn init(gpa: Allocator, raw: []const u8) !Regex {
     var out = Regex{
         .raw = raw,
         .inst = .init(gpa),
         .anchors = .{ .start = false, .end = false },
+        .allocator = gpa,
     };
     try out.compile();
     return out;
@@ -82,6 +102,30 @@ inline fn split(re: *Regex, next_idx: usize, alt_idx: usize) !void {
         .op = .split,
         .next = next_idx,
         .alt = alt_idx,
+    });
+}
+
+fn backref(re: *Regex) !Inst {
+    const num_start = re.cursor;
+    while (re.cursor < re.raw.len and isDigit(re.peek())) : (re.cursor += 1) {}
+    const num = std.fmt.parseInt(usize, re.raw[num_start..re.cursor], 10) catch
+        return error.InvalidBackReference;
+
+    // to account for the automatic next() at the end of parseAtom()
+    re.cursor -= 1;
+
+    return .{ .op = .{ .backref = num }, .next = re.inst.items.len + 1 };
+}
+
+fn escapedChar(re: *Regex) !void {
+    if (re.cursor + 1 >= re.raw.len) return error.UnexpectedEOF;
+    re.next();
+    const next_inst = re.inst.items.len + 1;
+    try re.inst.append(switch (re.peek()) {
+        'd' => .{ .op = .{ .class = &isDigit }, .next = next_inst },
+        'w' => .{ .op = .{ .class = &isAlphanumeric }, .next = next_inst },
+        '1'...'9' => try re.backref(),
+        else => return error.UnexpectedEOF,
     });
 }
 
@@ -140,16 +184,7 @@ fn parseAtom(re: *Regex) Error!void {
     defer re.next();
 
     switch (re.peek()) {
-        '\\' => {
-            if (re.cursor + 1 >= re.raw.len) return error.UnexpectedEOF;
-            re.next();
-            const next_inst = re.inst.items.len + 1;
-            try re.inst.append(switch (re.raw[re.cursor]) {
-                'd' => .{ .op = .{ .class = &isDigit }, .next = next_inst },
-                'w' => .{ .op = .{ .class = &isAlphanumeric }, .next = next_inst },
-                else => return error.UnexpectedEOF,
-            });
-        },
+        '\\' => try re.escapedChar(),
         '[' => try re.charGroup(),
         '.' => {
             try re.inst.append(.{
@@ -164,7 +199,18 @@ fn parseAtom(re: *Regex) Error!void {
         },
         '(' => {
             re.next(); // '('
+            const group_num = re.group_count;
+            re.group_count += 1;
+
+            try re.inst.append(.{
+                .op = .{ .group_start = group_num },
+                .next = re.inst.items.len + 1,
+            });
             try re.parseAlternation();
+            try re.inst.append(.{
+                .op = .{ .group_end = group_num },
+                .next = re.inst.items.len + 1,
+            });
         },
         else => try re.inst.append(.{
             .op = .{ .char = re.peek() },
@@ -213,6 +259,19 @@ fn parseConcat(re: *Regex) !void {
     }
 }
 
+fn parseAlternation(re: *Regex) !void {
+    const split_idx = re.inst.items.len;
+    try re.split(split_idx + 1, 0); // alt to be patched
+    try re.parseConcat();
+    if (re.cursor < re.raw.len and re.peek() == '|') {
+        re.inst.items[split_idx].alt = re.inst.items.len;
+        re.next();
+        const last_alt = re.inst.items.len - 1;
+        try re.parseAlternation();
+        re.inst.items[last_alt].next = re.inst.items.len;
+    }
+}
+
 test "compile" {
     const gpa = testing.allocator;
     var re = try Regex.init(gpa, "\\dab[\\dab]");
@@ -228,27 +287,20 @@ test "compile" {
     try testing.expect(inst[4].op.char == 'b');
 }
 
-fn parseAlternation(re: *Regex) !void {
-    const split_idx = re.inst.items.len;
-    try re.split(split_idx + 1, 0); // alt to be patched
-    try re.parseConcat();
-    if (re.cursor < re.raw.len and re.peek() == '|') {
-        re.inst.items[split_idx].alt = re.inst.items.len;
-        re.next();
-        const last_alt = re.inst.items.len - 1;
-        try re.parseAlternation();
-        re.inst.items[last_alt].next = re.inst.items.len;
-    }
-}
+const Capture = struct {
+    start: ?usize = null,
+    end: ?usize = null,
 
-fn matchInst(re: *Regex, inst: Inst, target: u8) bool {
-    for (re.patterns.items[inst.idx..][0..inst.len]) |pattern| {
-        if (pattern.match(target)) return !inst.negated;
+    fn getString(self: Capture, input: []const u8) ?[]const u8 {
+        const start = self.start orelse return null;
+        const end = self.end orelse return null;
+        return input[start..end];
     }
-    return inst.negated;
-}
+};
 
-fn matchAt(re: *Regex, input_idx: usize, inst_idx: usize) bool {
+const MatchState = std.ArrayList(Capture);
+
+fn matchAt(re: *Regex, input_idx: usize, inst_idx: usize, state: *MatchState) !bool {
     if (re.inst.items.len == 0) return true; // nothing to match
     assert(inst_idx < re.inst.items.len); // all inst should never point past op.end
 
@@ -258,38 +310,76 @@ fn matchAt(re: *Regex, input_idx: usize, inst_idx: usize) bool {
     return switch (inst.op) {
         .nil => return false,
         .end => {
-            // Found a path to the end state.
-            // return input_idx >= re.input.len; ???
             if (re.anchors.end and input_idx != re.input.len) return false;
             return true;
         },
-        .split => return re.matchAt(input_idx, inst.next) or re.matchAt(input_idx, inst.alt),
+        .split => {
+            // Try both paths with cloned states
+            var state_copy = try state.clone();
+            defer state_copy.deinit();
+
+            return try re.matchAt(input_idx, inst.next, state) or
+                try re.matchAt(input_idx, inst.alt, &state_copy);
+        },
         .char => |c| {
             if (input_idx >= re.input.len) return false; // not enough input to match pattern
             if (re.input[input_idx] == c) {
-                return re.matchAt(input_idx + 1, inst.next);
+                return try re.matchAt(input_idx + 1, inst.next, state);
             }
-            return re.matchAt(input_idx, inst.alt);
+            return try re.matchAt(input_idx, inst.alt, state);
         },
         .class => |cl| {
             if (input_idx >= re.input.len) return false; // not enough input to match pattern
             if (cl(re.input[input_idx])) {
-                return re.matchAt(input_idx + 1, inst.next);
+                return try re.matchAt(input_idx + 1, inst.next, state);
             }
-            return re.matchAt(input_idx, inst.alt);
+            return try re.matchAt(input_idx, inst.alt, state);
+        },
+        .group_start => |group_num| {
+            while (state.items.len <= group_num) {
+                state.appendAssumeCapacity(.{});
+            }
+            assert(group_num == state.items.len - 1);
+            state.items[group_num].start = input_idx;
+            return try re.matchAt(input_idx, inst.next, state);
+        },
+        .group_end => |group_num| {
+            assert(group_num == state.items.len - 1);
+            state.items[group_num].end = input_idx;
+            return try re.matchAt(input_idx, inst.next, state);
+        },
+        .backref => |group_num| {
+            if (group_num == 0 or group_num > state.items.len) return false; // TODO: add better error handling
+
+            const group = &state.items[group_num - 1]; // groups are 1-indexed in regex
+            const text = group.getString(re.input) orelse unreachable;
+            if (input_idx + text.len > re.input.len) return false;
+            if (std.mem.eql(u8, text, re.input[input_idx..][0..text.len])) {
+                return try re.matchAt(input_idx + text.len, inst.next, state);
+            }
+            return try re.matchAt(input_idx, inst.alt, state);
         },
     };
 }
 
 pub fn match(re: *Regex, input: []const u8) bool {
     re.input = input;
-    if (re.anchors.start)
-        return re.matchAt(0, 1);
+    const match_range = if (re.anchors.start) 1 else input.len;
 
-    for (0..input.len) |i| {
-        if (re.matchAt(i, 1)) return true;
+    // TODO: add better error handling
+    for (0..match_range) |i| {
+        var state = MatchState.initCapacity(re.allocator, re.group_count) catch return false;
+        defer state.deinit();
+        if (re.matchAt(i, 1, &state) catch return false) return true;
     }
+
     return false;
+}
+
+fn printInstructions(re: Regex) void {
+    for (re.inst.items, 0..) |in, i| {
+        std.debug.print("{d:>4} {}\n", .{ i, in });
+    }
 }
 
 test "match char and escaped char" {
@@ -356,20 +446,17 @@ test "quantifier" {
     const input1 = "cats";
 
     const raw = "ca+ts";
-    const input2 = "caats";
-    const input3 = "caaats";
     var re = try Regex.init(gpa, raw);
     defer re.deinit();
     try expect(re.match(input1));
-    try expect(re.match(input2));
-    try expect(re.match(input3));
+    try expect(re.match("caats"));
+    try expect(re.match("caaats"));
 
     const raw2 = "ca?ts";
-    const input0 = "cts";
     var re2 = try Regex.init(gpa, raw2);
     defer re2.deinit();
     try expect(re2.match(input1));
-    try expect(re2.match(input0));
+    try expect(re2.match("cts"));
 }
 
 test "match wildcard" {
@@ -403,9 +490,6 @@ test "match groups with alternation" {
     var re = try Regex.init(gpa, raw);
     defer re.deinit();
 
-    // for (re.inst.items, 0..) |in, i| {
-    //     std.debug.print("{d:>2} {any}\n", .{ i, in });
-    // }
     try expect(re.match("abl123"));
     try expect(re.match("cde123"));
     try expect(re.match("ablcde123"));
@@ -420,4 +504,27 @@ test "match groups with alternation" {
     try expect(re2.match("xby"));
     try expect(re2.match("xcy"));
     try expect(!re2.match("xdy"));
+}
+
+test "backreference" {
+    const expect = testing.expect;
+    const gpa = testing.allocator;
+
+    const raw = "(a|b+) \\1";
+    var re = try Regex.init(gpa, raw);
+    defer re.deinit();
+
+    try expect(re.match("a a"));
+    try expect(re.match("b b"));
+    try expect(re.match("bbb bbb"));
+    try expect(re.match("bbb bb")); // match is "bb bb"
+    try expect(!re.match("a b"));
+    try expect(!re.match("b a"));
+
+    const raw2 = "(\\d+) (\\w+) squares and \\1 \\2 circles";
+    var re2 = try Regex.init(gpa, raw2);
+    defer re2.deinit();
+
+    try expect(re2.match("3 red squares and 3 red circles"));
+    try expect(!re2.match("3 red squares and 4 red circles"));
 }
