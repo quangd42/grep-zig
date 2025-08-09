@@ -248,6 +248,27 @@ fn parseRepetition(re: *Regex) !void {
             }
             re.next();
         },
+        '*' => {
+            // inst.len is next_idx before the shift
+            // + 1 for the shift, + 1 for the repeat split inst
+            const next_idx = re.inst.items.len + 2;
+            try re.inst.insert(start_idx, .{
+                .op = .split,
+                .next = start_idx + 1,
+                .alt = next_idx,
+            });
+            // patch idx of all inst after the split
+            for (start_idx + 1..re.inst.items.len) |i| {
+                const inst = &re.inst.items[i];
+                inst.* = .{
+                    .op = inst.op,
+                    .next = inst.next + 1,
+                    .alt = inst.alt + 1,
+                };
+            }
+            try re.split(start_idx, re.inst.items.len + 1);
+            re.next();
+        },
         else => return,
     }
 }
@@ -456,6 +477,14 @@ test "quantifier" {
     defer re2.deinit();
     try expect(re2.match(input1));
     try expect(re2.match("cts"));
+
+    const raw3 = "ca*ts";
+    var re3 = try Regex.init(gpa, raw3);
+    defer re3.deinit();
+    try expect(re3.match("cts"));
+    try expect(re3.match(input1));
+    try expect(re3.match("caats"));
+    try expect(re3.match("caaats"));
 }
 
 test "match wildcard" {

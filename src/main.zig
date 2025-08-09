@@ -1,12 +1,16 @@
 const std = @import("std");
 const mem = std.mem;
+const fs = std.fs;
+const Allocator = mem.Allocator;
 const testing = std.testing;
+
+const Grep = @import("Grep.zig");
 const Regex = @import("Regex.zig");
 
 pub fn main() !void {
-    var buffer: [1024]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&buffer);
-    const gpa = fba.allocator();
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
 
     const args = try std.process.argsAlloc(gpa);
     defer std.process.argsFree(gpa, args);
@@ -17,20 +21,30 @@ pub fn main() !void {
     }
 
     const pattern = args[2];
-    var input_line: [1024]u8 = undefined;
-    const input_len = try std.io.getStdIn().reader().read(&input_line);
-    const input_slice = input_line[0..input_len];
-
-    var aa = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer aa.deinit();
-    const arena = aa.allocator();
-
-    var re = try Regex.init(arena, pattern);
+    var matched = false;
+    var re = try Regex.init(gpa, pattern);
     defer re.deinit();
 
-    if (re.match(input_slice)) {
+    if (args.len == 3) {
+        var input_line: [1024]u8 = undefined;
+        const input_len = try std.io.getStdIn().reader().read(&input_line);
+        const input_slice = input_line[0..input_len];
+
+        matched = re.match(input_slice);
+    } else {
+        const path = args[3];
+        var grep = Grep.init(re);
+        const dir = fs.cwd();
+        matched = try grep.grepFile(dir, path);
+    }
+
+    if (matched) {
         std.process.exit(0);
     } else {
         std.process.exit(1);
     }
+}
+
+test "main" {
+    @import("std").testing.refAllDeclsRecursive(@This());
 }
