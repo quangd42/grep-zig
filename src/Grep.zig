@@ -16,7 +16,7 @@ pub fn init(re: Regex) Grep {
     };
 }
 
-pub fn grepFile(self: *Grep, dir: fs.Dir, filepath: []const u8) !bool {
+pub fn grepFile(self: *Grep, dir: fs.Dir, filepath: []const u8, is_multiple: bool) !bool {
     const file = try dir.openFile(filepath, .{});
     defer file.close();
 
@@ -25,6 +25,10 @@ pub fn grepFile(self: *Grep, dir: fs.Dir, filepath: []const u8) !bool {
     var buffer: [1024]u8 = undefined;
     while (try file.reader().readUntilDelimiterOrEof(&buffer, '\n')) |line| {
         if (self.re.match(line)) {
+            if (is_multiple) {
+                _ = try stdout.write(filepath);
+                _ = try stdout.write(":");
+            }
             _ = try stdout.write(line);
             _ = try stdout.write("\n");
             matched += 1;
@@ -39,7 +43,7 @@ fn grepDirRecursive(self: *Grep, dir: fs.Dir, subdir_path: []const u8) !bool {
     var it = subdir.iterate();
     while (try it.next()) |entry| {
         switch (entry.kind) {
-            .file => return self.grepFile(subdir, entry.name),
+            .file => return self.grepFile(subdir, entry.name, true),
             .directory => return self.grepDirRecursive(subdir, entry.name),
             else => return false,
         }

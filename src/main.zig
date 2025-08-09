@@ -15,6 +15,14 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(gpa);
     defer std.process.argsFree(gpa, args);
 
+    if (try run(gpa, args)) {
+        std.process.exit(0);
+    } else {
+        std.process.exit(1);
+    }
+}
+
+fn run(gpa: Allocator, args: [][:0]u8) !bool {
     if (args.len < 3 or !mem.eql(u8, args[1], "-E")) {
         std.debug.print("Expected first argument to be '-E'\n", .{});
         std.process.exit(1);
@@ -33,18 +41,14 @@ pub fn main() !void {
         matched = re.match(input_slice);
     } else {
         const files = args[3..];
+        const is_multiple = files.len > 1;
         var grep = Grep.init(re);
         const dir = fs.cwd();
         for (files) |path| {
-            if (try grep.grepFile(dir, path)) matched = true;
+            if (try grep.grepFile(dir, path, is_multiple)) matched = true;
         }
     }
-
-    if (matched) {
-        std.process.exit(0);
-    } else {
-        std.process.exit(1);
-    }
+    return matched;
 }
 
 test "main" {
