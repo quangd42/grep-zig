@@ -32,10 +32,12 @@ pub fn main() !void {
 
         matched = re.match(input_slice);
     } else {
-        const path = args[3];
+        const files = args[3..];
         var grep = Grep.init(re);
         const dir = fs.cwd();
-        matched = try grep.grepFile(dir, path);
+        for (files) |path| {
+            if (try grep.grepFile(dir, path)) matched = true;
+        }
     }
 
     if (matched) {
