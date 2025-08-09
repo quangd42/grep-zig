@@ -23,31 +23,40 @@ pub fn main() !void {
 }
 
 fn run(gpa: Allocator, args: [][:0]u8) !bool {
-    if (args.len < 3 or !mem.eql(u8, args[1], "-E")) {
+    if (args.len < 3) {
         std.debug.print("Expected first argument to be '-E'\n", .{});
         std.process.exit(1);
     }
 
-    const pattern = args[2];
+    const recursive = mem.eql(u8, args[1], "-r");
     var matched = false;
-    var re = try Regex.init(gpa, pattern);
-    defer re.deinit();
-
-    if (args.len == 3) {
-        var input_line: [1024]u8 = undefined;
-        const input_len = try std.io.getStdIn().reader().read(&input_line);
-        const input_slice = input_line[0..input_len];
-
-        matched = re.match(input_slice);
-    } else {
-        const files = args[3..];
-        const is_multiple = files.len > 1;
-        var grep = Grep.init(re);
-        const dir = fs.cwd();
-        for (files) |path| {
-            if (try grep.grepFile(dir, path, is_multiple)) matched = true;
+    if (recursive) {
+        if (!mem.eql(u8, args[2], "-E")) {
+            std.debug.print("Expected second argument to be '-E'\n", .{});
+            std.process.exit(1);
         }
+        const pattern = args[3];
+        var re = try Regex.init(gpa, pattern);
+        defer re.deinit();
+        const path = args[4];
+        var grep = Grep.init(re);
+        matched = try grep.grepDir(path);
+    } else if (mem.eql(u8, args[1], "-E")) {
+        const pattern = args[2];
+        var re = try Regex.init(gpa, pattern);
+        defer re.deinit();
+        var grep = Grep.init(re);
+        const filepaths = args[3..];
+        if (filepaths.len == 0) {
+            matched = try grep.grepStdin();
+        } else {
+            matched = try grep.grepFiles(filepaths);
+        }
+    } else {
+        std.debug.print("Expected first argument to be '-E'\n", .{});
+        std.process.exit(1);
     }
+
     return matched;
 }
 
