@@ -1,3 +1,0 @@
-pumpkin
-celery
-cauliflower
