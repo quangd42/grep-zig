@@ -1,4 +1,4 @@
-[![progress-banner](https://backend.codecrafters.io/progress/grep/79f62e45-ebd5-467b-99fb-af2b65fa8b37)](https://app.codecrafters.io/users/codecrafters-bot?r=2qF)
+[![progress-banner](https://backend.codecrafters.io/progress/grep/79f62e45-ebd5-467b-99fb-af2b65fa8b37)](https://app.codecrafters.io/users/quangd42)
 
 This is my Zig solutions to the
 ["Build Your Own grep" Challenge](https://app.codecrafters.io/courses/grep/overview).

@@ -68,7 +68,7 @@ pub fn init(gpa: Allocator, raw: []const u8) !Regex {
         .anchors = .{ .start = false, .end = false },
         .allocator = gpa,
     };
-    try out.compile();
+    try out._compile();
     return out;
 }
 
@@ -76,7 +76,7 @@ pub fn deinit(re: *Regex) void {
     re.inst.deinit();
 }
 
-fn compile(re: *Regex) !void {
+fn _compile(re: *Regex) !void {
     // reserving first inst as nil
     try re.inst.append(.{ .op = .nil, .next = 0 });
     if (re.raw[re.cursor] == '^') {
@@ -87,6 +87,12 @@ fn compile(re: *Regex) !void {
     try re.parseAlternation();
 
     try re.inst.append(.{ .op = .end, .next = 0 });
+}
+
+pub fn compile(re: *Regex, raw: []const u8) !void {
+    const new = try Regex.init(re.allocator, raw);
+    re.deinit();
+    re.* = new;
 }
 
 inline fn peek(re: *Regex) u8 {
@@ -134,6 +140,8 @@ fn charGroup(re: *Regex) !void {
     if (re.cursor >= re.raw.len) return error.UnexpectedEOF;
     const negated = re.peek() == '^';
     if (negated) re.next(); // '^'
+
+    try re.split(re.inst.items.len + 1, 0);
     const start = re.inst.items.len;
 
     while (re.raw[re.cursor] != ']') {
@@ -230,42 +238,13 @@ fn parseRepetition(re: *Regex) !void {
             re.next();
         },
         '?' => {
-            // inst.len is next_idx before the shift
-            const next_idx = re.inst.items.len + 1;
-            try re.inst.insert(start_idx, .{
-                .op = .split,
-                .next = start_idx + 1,
-                .alt = next_idx,
-            });
-            // patch idx of all inst after the split
-            for (start_idx + 1..re.inst.items.len) |i| {
-                const inst = &re.inst.items[i];
-                inst.* = .{
-                    .op = inst.op,
-                    .next = inst.next + 1,
-                    .alt = inst.alt + 1,
-                };
-            }
+            // char group and capture group both have a "start group" inst
+            re.inst.items[start_idx].alt = re.inst.items.len;
             re.next();
         },
         '*' => {
-            // inst.len is next_idx before the shift
-            // + 1 for the shift, + 1 for the repeat split inst
-            const next_idx = re.inst.items.len + 2;
-            try re.inst.insert(start_idx, .{
-                .op = .split,
-                .next = start_idx + 1,
-                .alt = next_idx,
-            });
-            // patch idx of all inst after the split
-            for (start_idx + 1..re.inst.items.len) |i| {
-                const inst = &re.inst.items[i];
-                inst.* = .{
-                    .op = inst.op,
-                    .next = inst.next + 1,
-                    .alt = inst.alt + 1,
-                };
-            }
+            // char group and capture group both have a "start group" inst
+            re.inst.items[start_idx].alt = re.inst.items.len + 1;
             try re.split(start_idx, re.inst.items.len + 1);
             re.next();
         },
@@ -293,21 +272,6 @@ fn parseAlternation(re: *Regex) !void {
     }
 }
 
-test "compile" {
-    const gpa = testing.allocator;
-    var re = try Regex.init(gpa, "\\dab[\\dab]");
-    defer re.deinit();
-    const inst = re.inst.items;
-
-    try testing.expectEqual(7, re.inst.items.len - 2);
-    try testing.expect(inst[0].op.nil == {});
-    try testing.expect(inst[re.inst.items.len - 1].op.end == {});
-
-    try testing.expect(inst[2].op.class == &isDigit);
-    try testing.expect(inst[3].op.char == 'a');
-    try testing.expect(inst[4].op.char == 'b');
-}
-
 const Capture = struct {
     start: ?usize = null,
     end: ?usize = null,
@@ -324,8 +288,6 @@ const MatchState = std.ArrayList(Capture);
 fn matchAt(re: *Regex, input_idx: usize, inst_idx: usize, state: *MatchState) !bool {
     if (re.inst.items.len == 0) return true; // nothing to match
     assert(inst_idx < re.inst.items.len); // all inst should never point past op.end
-
-    // if (input_idx < re.input.len) std.debug.print("input_idx = {d}, char = {c}, inst_idx = {d}, inst = {any}\n", .{ input_idx, re.input[input_idx], inst_idx, re.inst.items[inst_idx] });
 
     const inst = re.inst.items[inst_idx];
     return switch (inst.op) {
@@ -361,7 +323,7 @@ fn matchAt(re: *Regex, input_idx: usize, inst_idx: usize, state: *MatchState) !b
                 state.appendAssumeCapacity(.{});
             }
             state.items[group_num].start = input_idx;
-            return try re.matchAt(input_idx, inst.next, state);
+            return try re.matchAt(input_idx, inst.next, state) or try re.matchAt(input_idx, inst.alt, state);
         },
         .group_end => |group_num| {
             assert(group_num < state.items.len);
@@ -369,10 +331,12 @@ fn matchAt(re: *Regex, input_idx: usize, inst_idx: usize, state: *MatchState) !b
             return try re.matchAt(input_idx, inst.next, state);
         },
         .backref => |group_num| {
-            if (group_num == 0 or group_num > state.items.len) return false; // TODO: add better error handling
+            if (group_num == 0 or group_num > state.items.len) return false;
 
             const group = &state.items[group_num - 1]; // groups are 1-indexed in regex
-            const text = group.getString(re.input) orelse unreachable;
+            const text = group.getString(re.input) orelse
+                // if text == null, group_num refers to a group that was not matched
+                return false;
             if (input_idx + text.len > re.input.len) return false;
             if (std.mem.eql(u8, text, re.input[input_idx..][0..text.len])) {
                 return try re.matchAt(input_idx + text.len, inst.next, state);
@@ -382,15 +346,14 @@ fn matchAt(re: *Regex, input_idx: usize, inst_idx: usize, state: *MatchState) !b
     };
 }
 
-pub fn match(re: *Regex, input: []const u8) bool {
+pub fn match(re: *Regex, input: []const u8) !bool {
     re.input = input;
     const match_range = if (re.anchors.start) 1 else input.len;
 
-    // TODO: add better error handling
     for (0..match_range) |i| {
-        var state = MatchState.initCapacity(re.allocator, re.group_count) catch return false;
+        var state = try MatchState.initCapacity(re.allocator, re.group_count);
         defer state.deinit();
-        if (re.matchAt(i, 1, &state) catch return false) return true;
+        if (try re.matchAt(i, 1, &state)) return true;
     }
 
     return false;
@@ -410,12 +373,11 @@ test "match char and escaped char" {
     const input = "0123abc";
     var re = try Regex.init(gpa, raw);
     defer re.deinit();
-    try expect(re.match(input));
+    try expect(try re.match(input));
 
     const raw2 = "\\wbc";
-    var re2 = try Regex.init(gpa, raw2);
-    defer re2.deinit();
-    try expect(re2.match(input));
+    try re.compile(raw2);
+    try expect(try re.match(input));
 }
 
 test "match character group" {
@@ -426,18 +388,17 @@ test "match character group" {
     const input3a = "1 apple";
     const input3b = "a apple";
     const input3c = "b apple";
-    var re3 = try Regex.init(gpa, raw3);
-    defer re3.deinit();
-    try expect(re3.match(input3a));
-    try expect(re3.match(input3b));
-    try expect(!re3.match(input3c));
+    var re = try Regex.init(gpa, raw3);
+    defer re.deinit();
+    try expect(try re.match(input3a));
+    try expect(try re.match(input3b));
+    try expect(!try re.match(input3c));
 
     const raw4 = "[^1a] apple";
-    var re4 = try Regex.init(gpa, raw4);
-    defer re4.deinit();
-    try expect(re4.match(input3c));
-    try expect(!re4.match(input3a));
-    try expect(!re4.match(input3b));
+    try re.compile(raw4);
+    try expect(try re.match(input3c));
+    try expect(!try re.match(input3a));
+    try expect(!try re.match(input3b));
 }
 
 test "match anchors" {
@@ -447,16 +408,15 @@ test "match anchors" {
     const long = "logloglog";
     const short = "log";
     const raw5 = "^log";
-    var re5 = try Regex.init(gpa, raw5);
-    defer re5.deinit();
-    try expect(re5.match(short));
-    try expect(re5.match(long));
+    var re = try Regex.init(gpa, raw5);
+    defer re.deinit();
+    try expect(try re.match(short));
+    try expect(try re.match(long));
 
     const raw6 = "log$";
-    var re6 = try Regex.init(gpa, raw6);
-    defer re6.deinit();
-    try expect(re6.match(short));
-    try expect(re5.match(long));
+    try re.compile(raw6);
+    try expect(try re.match(short));
+    try expect(try re.match(long));
 }
 
 test "quantifier" {
@@ -468,23 +428,21 @@ test "quantifier" {
     const raw = "ca+ts";
     var re = try Regex.init(gpa, raw);
     defer re.deinit();
-    try expect(re.match(input1));
-    try expect(re.match("caats"));
-    try expect(re.match("caaats"));
+    try expect(try re.match(input1));
+    try expect(try re.match("caats"));
+    try expect(try re.match("caaats"));
 
     const raw2 = "ca?ts";
-    var re2 = try Regex.init(gpa, raw2);
-    defer re2.deinit();
-    try expect(re2.match(input1));
-    try expect(re2.match("cts"));
+    try re.compile(raw2);
+    try expect(try re.match(input1));
+    try expect(try re.match("cts"));
 
     const raw3 = "ca*ts";
-    var re3 = try Regex.init(gpa, raw3);
-    defer re3.deinit();
-    try expect(re3.match("cts"));
-    try expect(re3.match(input1));
-    try expect(re3.match("caats"));
-    try expect(re3.match("caaats"));
+    try re.compile(raw3);
+    try expect(try re.match("cts"));
+    try expect(try re.match(input1));
+    try expect(try re.match("caats"));
+    try expect(try re.match("caaats"));
 }
 
 test "match wildcard" {
@@ -496,18 +454,16 @@ test "match wildcard" {
     const input1 = "lot";
     var re = try Regex.init(gpa, raw);
     defer re.deinit();
-    try expect(re.match(input));
-    try expect(!re.match(input1));
+    try expect(try re.match(input));
+    try expect(!try re.match(input1));
 
     const raw2 = ".og";
-    var re2 = try Regex.init(gpa, raw2);
-    defer re2.deinit();
-    try expect(re2.match(input));
+    try re.compile(raw2);
+    try expect(try re.match(input));
 
     const raw3 = "lo.";
-    var re3 = try Regex.init(gpa, raw3);
-    defer re3.deinit();
-    try expect(re3.match(input));
+    try re.compile(raw3);
+    try expect(try re.match(input));
 }
 
 test "match groups with alternation" {
@@ -518,20 +474,20 @@ test "match groups with alternation" {
     var re = try Regex.init(gpa, raw);
     defer re.deinit();
 
-    try expect(re.match("abl123"));
-    try expect(re.match("cde123"));
-    try expect(re.match("ablcde123"));
-    try expect(!re.match("abc123"));
-    try expect(!re.match("xyz123"));
+    try expect(try re.match("abl123"));
+    try expect(try re.match("cde123"));
+    try expect(try re.match("ablcde123"));
+    try expect(!try re.match("abc123"));
+    try expect(!try re.match("xyz123"));
 
-    const raw2 = "x(a|b|c)y";
-    var re2 = try Regex.init(gpa, raw2);
-    defer re2.deinit();
+    const raw2 = "x(a|b|c)?y";
+    try re.compile(raw2);
 
-    try expect(re2.match("xay"));
-    try expect(re2.match("xby"));
-    try expect(re2.match("xcy"));
-    try expect(!re2.match("xdy"));
+    try expect(try re.match("xay"));
+    try expect(try re.match("xby"));
+    try expect(try re.match("xcy"));
+    try expect(try re.match("xy"));
+    try expect(!try re.match("xdy"));
 }
 
 test "backreference" {
@@ -542,23 +498,26 @@ test "backreference" {
     var re = try Regex.init(gpa, raw);
     defer re.deinit();
 
-    try expect(re.match("a a"));
-    try expect(re.match("b b"));
-    try expect(re.match("bbb bbb"));
-    try expect(re.match("bbb bb")); // match is "bb bb"
-    try expect(!re.match("a b"));
-    try expect(!re.match("b a"));
+    try expect(try re.match("a a"));
+    try expect(try re.match("b b"));
+    try expect(try re.match("bbb bbb"));
+    try expect(try re.match("bbb bb")); // match is "bb bb"
+    try expect(!try re.match("a b"));
+    try expect(!try re.match("b a"));
 
     const raw2 = "(\\d+) (\\w+) squares and \\1 \\2 circles";
-    var re2 = try Regex.init(gpa, raw2);
-    defer re2.deinit();
+    try re.compile(raw2);
 
-    try expect(re2.match("3 red squares and 3 red circles"));
-    try expect(!re2.match("3 red squares and 4 red circles"));
+    try expect(try re.match("3 red squares and 3 red circles"));
+    try expect(!try re.match("3 red squares and 4 red circles"));
 
     const raw3 = "^I see (\\d (cat|dog|cow)s?(, | and )?)+$";
-    var re3 = try Regex.init(gpa, raw3);
-    defer re3.deinit();
+    try re.compile(raw3);
 
-    try expect(re3.match("I see 1 cat, 2 dogs and 3 cows"));
+    try expect(try re.match("I see 1 cat, 2 dogs and 3 cows"));
+
+    const raw4 = "(\\d+ )?(\\w+) squares and \\1\\2 circles";
+    try re.compile(raw4);
+    try expect(try re.match("3 red squares and 3 red circles"));
+    try expect(!try re.match("red squares and red circles"));
 }

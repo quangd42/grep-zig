@@ -55,7 +55,7 @@ pub fn grepStdin(self: *Grep) !bool {
     const input_len = try std.io.getStdIn().reader().read(&input_line);
     const input_slice = input_line[0..input_len];
 
-    return self.re.match(input_slice);
+    return try self.re.match(input_slice);
 }
 
 fn grepFile(self: *Grep, dir: fs.Dir, filepath: []const u8, is_multiple: bool) !bool {
@@ -66,7 +66,7 @@ fn grepFile(self: *Grep, dir: fs.Dir, filepath: []const u8, is_multiple: bool) !
     var matched: usize = 0;
     var buffer: [1024]u8 = undefined;
     while (try file.reader().readUntilDelimiterOrEof(&buffer, '\n')) |line| {
-        if (self.re.match(line)) {
+        if (try self.re.match(line)) {
             if (is_multiple) {
                 _ = try stdout.write(filepath);
                 _ = try stdout.write(":");
@@ -125,9 +125,8 @@ test "grep files" {
     var g = Grep{ .re = re, .options = Options{} };
     try expect(try g.grepFile(cwd, "test/data/fruits.txt", false));
 
-    var re2 = try Regex.init(gpa, "b.+");
-    defer re2.deinit();
-    var g2 = Grep{ .re = re2, .options = Options{} };
+    try re.compile("b.+");
+    var g2 = Grep{ .re = re, .options = Options{} };
     var filepaths: [2][]const u8 = .{ "test/data/fruits.txt", "test/data/vegetables.txt" };
     try expect(try g2.grepFiles(&filepaths));
 }
@@ -202,12 +201,12 @@ const Options = struct {
     }
 };
 
-fn constCastArgs(gpa: Allocator, from: [][:0]const u8) ![][:0]u8 {
-    const to = try gpa.alloc([:0]u8, from.len);
-    for (from, 0..) |a, i| {
-        to[i] = @constCast(a);
+fn makeArgs(comptime args: []const []const u8) [args.len][:0]u8 {
+    var result: [args.len][:0]u8 = undefined;
+    inline for (args, 0..) |arg, i| {
+        result[i] = @constCast(arg ++ "\x00");
     }
-    return to;
+    return result;
 }
 
 test "parse args" {
@@ -217,10 +216,10 @@ test "parse args" {
 
     const pattern = "b.+";
     const path1 = "fruits.txt";
-    var raw_args = [_][:0]const u8{ "-r", "-E", pattern, path1 };
-    const args = try constCastArgs(gpa, &raw_args);
-    defer gpa.free(args);
-    var g = try Grep.init(gpa, args);
+
+    // one path
+    var args = makeArgs(&[_][]const u8{ "-r", "-E", pattern, path1 });
+    var g = try Grep.init(gpa, &args);
     defer g.deinit();
     try expect(g.options.extended_regex);
     try expect(g.options.recursive);
@@ -228,23 +227,23 @@ test "parse args" {
     try expect(g.options.paths.?.len == 1);
     try expectEqualStrings(path1[0..], g.options.paths.?[0]);
 
+    // multiple paths
     const path2 = "vegetables.txt";
-    var raw_args2 = [_][:0]const u8{ "-rE", pattern, path1, path2 };
-    const args2 = try constCastArgs(gpa, &raw_args2);
-    var g2 = try Grep.init(gpa, args2);
-    defer gpa.free(args2);
+    const path3 = "condiments.txt";
+    var args2 = makeArgs(&[_][]const u8{ "-rE", pattern, path1, path2, path3 });
+    var g2 = try Grep.init(gpa, &args2);
     defer g2.deinit();
     try expect(g2.options.extended_regex);
     try expect(g2.options.recursive);
     try expectEqualStrings(pattern[0..], g2.options.pattern.?);
-    try expect(g2.options.paths.?.len == 2);
+    try expect(g2.options.paths.?.len == 3);
     try expectEqualStrings(path1[0..], g2.options.paths.?[0]);
     try expectEqualStrings(path2[0..], g2.options.paths.?[1]);
+    try expectEqualStrings(path3[0..], g2.options.paths.?[2]);
 
-    var raw_noflag = [_][:0]const u8{ pattern, path1, path2 };
-    const noflag = try constCastArgs(gpa, &raw_noflag);
-    var g3 = try Grep.init(gpa, noflag);
-    defer gpa.free(noflag);
+    // no flag
+    var noflag = makeArgs(&[_][]const u8{ pattern, path1, path2 });
+    var g3 = try Grep.init(gpa, &noflag);
     defer g3.deinit();
     try expect(!g3.options.extended_regex);
     try expect(!g3.options.recursive);
@@ -253,20 +252,16 @@ test "parse args" {
     try expectEqualStrings(path1[0..], g3.options.paths.?[0]);
     try expectEqualStrings(path2[0..], g3.options.paths.?[1]);
 
-    // test no paths
-    var raw_nopath = [_][:0]const u8{ "-r", pattern };
-    const nopath = try constCastArgs(gpa, &raw_nopath);
-    defer gpa.free(nopath);
-    var g4 = try Grep.init(gpa, nopath);
+    // no paths
+    var nopath = makeArgs(&[_][]const u8{ "-r", pattern });
+    var g4 = try Grep.init(gpa, &nopath);
     defer g4.deinit();
     try expect(!g4.options.extended_regex);
     try expect(g4.options.recursive);
     try expectEqualStrings(pattern[0..], g4.options.pattern.?);
     try expect(g4.options.paths.?.len == 0);
 
-    // test no pattern
-    var raw_nopattern = [_][:0]const u8{"-E"};
-    const nopattern = try constCastArgs(gpa, &raw_nopattern);
-    defer gpa.free(nopattern);
-    try testing.expectError(error.NoPattern, Grep.init(gpa, nopattern));
+    // no pattern
+    var nopattern = makeArgs(&[_][]const u8{"-E"});
+    try testing.expectError(error.NoPattern, Grep.init(gpa, &nopattern));
 }
