@@ -13,8 +13,7 @@ pub const Inst = struct {
     alt: usize = 0,
 
     const Op = union(enum) {
-        char: u8,
-        class: *const fn (u8) bool,
+        match: CharMatcher,
         nil,
         end,
         split,
@@ -32,8 +31,13 @@ pub const Inst = struct {
         writer: anytype,
     ) !void {
         switch (self.op) {
-            .char => |c| try writer.print("char = '{c}'    ", .{c}),
-            .class => |cl| try writer.print("class = {*}", .{cl}),
+            .match => |m| {
+                switch (m) {
+                    .char => |c| try writer.print("char = '{c}'    ", .{c}),
+                    .func => |f| try writer.print("func = {*}", .{f}),
+                    .range => |r| try writer.print("match from '{c}' to '{c}' ", .{ r.from, r.to }),
+                }
+            },
             .nil => try writer.print("nil           ", .{}),
             .split => try writer.print("split         ", .{}),
             .end => try writer.print("end           ", .{}),
@@ -59,7 +63,7 @@ inst: std.ArrayList(Inst),
 anchors: Anchors,
 group_count: usize = 0,
 
-const Error = error{ OutOfMemory, UnexpectedEOF, UnsupportedClass, InvalidBackReference };
+const Error = error{ OutOfMemory, UnexpectedEOF, UnsupportedClass, InvalidBackReference, InvalidCharRange };
 
 pub fn init(gpa: Allocator, raw: []const u8) !Regex {
     var out = Regex{
@@ -111,6 +115,14 @@ inline fn split(re: *Regex, next_idx: usize, alt_idx: usize) !void {
     });
 }
 
+inline fn matchChar(re: *Regex, m: CharMatcher, next_idx: usize, alt_idx: usize) !void {
+    return re.inst.append(.{
+        .op = .{ .match = m },
+        .next = next_idx,
+        .alt = alt_idx,
+    });
+}
+
 fn backref(re: *Regex) !Inst {
     const num_start = re.cursor;
     while (re.cursor < re.raw.len and isDigit(re.peek())) : (re.cursor += 1) {}
@@ -128,8 +140,9 @@ fn escapedChar(re: *Regex) !void {
     re.next();
     const next_inst = re.inst.items.len + 1;
     try re.inst.append(switch (re.peek()) {
-        'd' => .{ .op = .{ .class = &isDigit }, .next = next_inst },
-        'w' => .{ .op = .{ .class = &isAlphanumeric }, .next = next_inst },
+        'd' => .{ .op = .{ .match = .{ .func = &isDigit } }, .next = next_inst },
+        'w' => .{ .op = .{ .match = .{ .func = &isAlphanumeric } }, .next = next_inst },
+        '-' => |c| .{ .op = .{ .match = .{ .char = c } }, .next = next_inst },
         '1'...'9' => try re.backref(),
         else => return error.UnexpectedEOF,
     });
@@ -146,7 +159,7 @@ fn charGroup(re: *Regex) !void {
 
     while (re.raw[re.cursor] != ']') {
         if (re.cursor >= re.raw.len) return error.UnexpectedEOF;
-        try re.parseAtom();
+        try re.parseAtom(true);
     }
     const group_next = re.inst.items.len;
     var i = start;
@@ -168,12 +181,57 @@ fn charGroup(re: *Regex) !void {
         // at last inst, if not matched then none of the negative patterns matched
         // add inst to consume current input char (which last inst is pointing to)
         try re.inst.append(.{
-            .op = .{ .class = &isAny },
+            .op = .{ .match = .{ .func = &isAny } },
             .next = group_next + 1,
             .alt = 0,
         });
     }
 }
+
+fn charRange(re: *Regex) !void {
+    if (re.cursor + 1 >= re.raw.len) return error.UnexpectedEOF;
+    const to = re.raw[re.cursor + 1];
+    const prev = re.raw[re.cursor - 1];
+
+    // '-' is matched literally
+    if (prev == '[' or
+        (prev == '^' and re.raw[re.cursor - 2] == '[') or // safe because in_char_group == true
+        to == ']')
+        return re.matchChar(.{ .char = re.peek() }, re.inst.items.len + 1, 0);
+
+    re.next(); // consume the 'to' char
+    const from_inst = &re.inst.items[re.inst.items.len - 1];
+    const from: u8 = blk: switch (from_inst.op) {
+        .match => |m| switch (m) {
+            .char => |c| break :blk c,
+            else => return error.InvalidCharRange,
+        },
+        else => return error.InvalidCharRange,
+    };
+
+    if (from > to) return error.InvalidCharRange;
+
+    from_inst.op = .{ .match = .{ .range = .{ .from = from, .to = to } } };
+}
+
+const CharMatcher = union(enum) {
+    char: u8,
+    range: Range,
+    func: *const fn (u8) bool,
+
+    const Range = struct {
+        from: u8,
+        to: u8,
+    };
+
+    fn match(s: CharMatcher, char: u8) bool {
+        return switch (s) {
+            .char => |c| char == c,
+            .range => |r| r.from <= char and r.to >= char,
+            .func => |f| f(char),
+        };
+    }
+};
 
 fn isDigit(c: u8) bool {
     return ascii.isDigit(c);
@@ -187,7 +245,7 @@ fn isAny(_: u8) bool {
     return true;
 }
 
-fn parseAtom(re: *Regex) Error!void {
+fn parseAtom(re: *Regex, in_char_group: bool) Error!void {
     if (re.cursor >= re.raw.len) return;
     defer re.next();
 
@@ -196,7 +254,7 @@ fn parseAtom(re: *Regex) Error!void {
         '[' => try re.charGroup(),
         '.' => {
             try re.inst.append(.{
-                .op = .{ .class = &isAny },
+                .op = .{ .match = .{ .func = &isAny } },
                 .next = re.inst.items.len + 1,
             });
         },
@@ -220,8 +278,14 @@ fn parseAtom(re: *Regex) Error!void {
                 .next = re.inst.items.len + 1,
             });
         },
+        '-' => {
+            if (!in_char_group)
+                return re.matchChar(.{ .char = re.peek() }, re.inst.items.len + 1, 0);
+
+            try re.charRange();
+        },
         else => try re.inst.append(.{
-            .op = .{ .char = re.peek() },
+            .op = .{ .match = .{ .char = re.peek() } },
             .next = re.inst.items.len + 1,
         }),
     }
@@ -229,7 +293,7 @@ fn parseAtom(re: *Regex) Error!void {
 
 fn parseRepetition(re: *Regex) !void {
     const start_idx = re.inst.items.len;
-    try re.parseAtom();
+    try re.parseAtom(false);
 
     if (re.cursor >= re.raw.len) return;
     switch (re.peek()) {
@@ -304,16 +368,9 @@ fn matchAt(re: *Regex, input_idx: usize, inst_idx: usize, state: *MatchState) !b
             return try re.matchAt(input_idx, inst.next, state) or
                 try re.matchAt(input_idx, inst.alt, &state_copy);
         },
-        .char => |c| {
+        .match => |char_matcher| {
             if (input_idx >= re.input.len) return false; // not enough input to match pattern
-            if (re.input[input_idx] == c) {
-                return try re.matchAt(input_idx + 1, inst.next, state);
-            }
-            return try re.matchAt(input_idx, inst.alt, state);
-        },
-        .class => |cl| {
-            if (input_idx >= re.input.len) return false; // not enough input to match pattern
-            if (cl(re.input[input_idx])) {
+            if (char_matcher.match(re.input[input_idx])) {
                 return try re.matchAt(input_idx + 1, inst.next, state);
             }
             return try re.matchAt(input_idx, inst.alt, state);
@@ -388,6 +445,7 @@ test "match character group" {
     const input3a = "1 apple";
     const input3b = "a apple";
     const input3c = "b apple";
+
     var re = try Regex.init(gpa, raw3);
     defer re.deinit();
     try expect(try re.match(input3a));
@@ -399,6 +457,21 @@ test "match character group" {
     try expect(try re.match(input3c));
     try expect(!try re.match(input3a));
     try expect(!try re.match(input3b));
+
+    const raw5 = "[x-z] always me";
+    try re.compile(raw5);
+    try expect(try re.match("y always me"));
+    try expect(!try re.match("b always me"));
+
+    const raw6 = "[^x-z] always me";
+    try re.compile(raw6);
+    try expect(!try re.match("y always me"));
+    try expect(try re.match("b always me"));
+
+    const raw7 = "[1-] ball";
+    try re.compile(raw7);
+    try expect(try re.match("1 ball"));
+    try expect(try re.match("- ball"));
 }
 
 test "match anchors" {
