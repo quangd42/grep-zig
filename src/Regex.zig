@@ -164,6 +164,16 @@ test "match char and escaped char" {
 
     const raw3 = "\\";
     try testing.expectError(error.UnexpectedEOF, re.compile(raw3));
+
+    const input2 = "\x08\x0D\x0B\x0C\x0A\x1B";
+    const raw4 = "\\t\\r\\v\\f\\n\\e";
+    try re.compile(raw4);
+    try expect(try re.match(input2));
+
+    const raw5 = "\\s+";
+    try re.compile(raw5);
+    try expect(try re.match(input2));
+    try expect(!try re.match("t"));
 }
 
 test "match character group" {

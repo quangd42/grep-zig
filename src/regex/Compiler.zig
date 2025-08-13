@@ -1,5 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const ascii = std.ascii;
+const cc = ascii.control_code;
 
 const Compiler = @This();
 
@@ -158,6 +160,13 @@ fn escapedChar(c: *Compiler) !void {
     switch (c.peek()) {
         'd' => try c.matchChar(.{ .func = &isDigit }, next_inst, 0),
         'w' => try c.matchChar(.{ .func = &isAlphanumeric }, next_inst, 0),
+        't' => try c.matchChar(.{ .char = cc.bs }, next_inst, 0),
+        'r' => try c.matchChar(.{ .char = cc.cr }, next_inst, 0),
+        'v' => try c.matchChar(.{ .char = cc.vt }, next_inst, 0),
+        'f' => try c.matchChar(.{ .char = cc.ff }, next_inst, 0),
+        'n' => try c.matchChar(.{ .char = cc.lf }, next_inst, 0),
+        'e' => try c.matchChar(.{ .char = cc.esc }, next_inst, 0),
+        's' => try c.matchChar(.{ .func = &isWhitespace }, next_inst, 0),
         '-', '|', '*', '+', '?', '(', ')' => |ch| try c.matchChar(.{ .char = ch }, next_inst, 0),
         '1'...'9' => try c.backref(),
         else => return error.UnexpectedEOF,
@@ -297,6 +306,13 @@ fn isDigit(c: u8) bool {
 fn isAlphanumeric(c: u8) bool {
     return switch (c) {
         '0'...'9', 'A'...'Z', 'a'...'z', '_' => true,
+        else => false,
+    };
+}
+
+fn isWhitespace(c: u8) bool {
+    return switch (c) {
+        ' ', '\t'...'\r' => true,
         else => false,
     };
 }
