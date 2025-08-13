@@ -11,6 +11,7 @@ input: []const u8 = &[_]u8{},
 allocator: Allocator,
 
 inst: []Compiler.Inst,
+patterns: []Compiler.Pattern,
 anchors: Compiler.Anchors,
 group_count: usize,
 
@@ -20,6 +21,7 @@ pub fn init(gpa: Allocator, raw: []const u8) !Regex {
     try compiler.compile();
     return Regex{
         .inst = try compiler.inst.toOwnedSlice(),
+        .patterns = try compiler.patterns.toOwnedSlice(),
         .anchors = compiler.anchors,
         .group_count = compiler.group_count,
         .allocator = gpa,
@@ -28,6 +30,7 @@ pub fn init(gpa: Allocator, raw: []const u8) !Regex {
 
 pub fn deinit(re: *Regex) void {
     re.allocator.free(re.inst);
+    re.allocator.free(re.patterns);
 }
 
 pub fn compile(re: *Regex, raw: []const u8) !void {
@@ -36,6 +39,7 @@ pub fn compile(re: *Regex, raw: []const u8) !void {
     try compiler.compile();
     re.deinit();
     re.inst = try compiler.inst.toOwnedSlice();
+    re.patterns = try compiler.patterns.toOwnedSlice();
     re.anchors = compiler.anchors;
     re.group_count = compiler.group_count;
 }
@@ -72,9 +76,9 @@ fn matchAt(re: *Regex, input_idx: usize, inst_idx: usize, state: *MatchState) !b
             return try re.matchAt(input_idx, inst.next, state) or
                 try re.matchAt(input_idx, inst.alt, &state_copy);
         },
-        .match => |pattern| {
+        .match => |p_idx| {
             if (input_idx >= re.input.len) return false; // not enough input to match pattern
-            if (pattern.match(re.input[input_idx])) {
+            if (re.patterns[p_idx].match(re.input[input_idx])) {
                 return try re.matchAt(input_idx + 1, inst.next, state);
             }
             return try re.matchAt(input_idx, inst.alt, state);
@@ -121,8 +125,26 @@ pub fn match(re: *Regex, input: []const u8) !bool {
 }
 
 fn printInstructions(re: Regex) void {
-    for (re.inst, 0..) |in, i| {
-        std.debug.print("{d:>4} {}\n", .{ i, in });
+    for (re.inst, 0..) |inst, i| {
+        const print = std.debug.print;
+        print("{d:>4} ", .{i});
+        switch (inst.op) {
+            .match => |p_idx| {
+                const pattern = re.patterns[p_idx];
+                switch (pattern) {
+                    .char => |c| print("char = '{c}'    ", .{c}),
+                    .func => |f| print("func = {*}", .{f}),
+                    .range => |r| print("match from '{c}' to '{c}' ", .{ r.from, r.to }),
+                }
+            },
+            .nil => print("nil           ", .{}),
+            .split => print("split         ", .{}),
+            .end => print("end           ", .{}),
+            .group_start => |g| print("grp_start = {d:<2}", .{g}),
+            .group_end => |g| print("grp_end = {d:<2}  ", .{g}),
+            .backref => |g| print("backref = {d:<2}  ", .{g}),
+        }
+        print(", next = {d:<4}, alt = {d:<4}\n", .{ inst.next, inst.alt });
     }
 }
 

@@ -16,19 +16,22 @@ const Error = error{
 
 raw: []const u8,
 inst: std.ArrayList(Inst),
-cursor: usize = 0,
-group_count: usize = 0,
+patterns: std.ArrayList(Pattern),
+cursor: u32 = 0,
+group_count: u32 = 0,
 anchors: Anchors = .{ .start = false, .end = false },
 
 pub fn init(gpa: Allocator, raw: []const u8) Compiler {
     return .{
         .raw = raw,
         .inst = .init(gpa),
+        .patterns = .init(gpa),
     };
 }
 
 pub fn deinit(c: *Compiler) void {
     c.inst.deinit();
+    c.patterns.deinit();
 }
 
 pub fn compile(c: *Compiler) !void {
@@ -90,12 +93,12 @@ fn compileRepetition(c: *Compiler) !void {
         },
         '?' => {
             // char group and capture group both have a "start group" inst
-            c.inst.items[start_idx].alt = c.inst.items.len;
+            c.inst.items[start_idx].alt = @intCast(c.inst.items.len);
             c.next();
         },
         '*' => {
             // char group and capture group both have a "start group" inst
-            c.inst.items[start_idx].alt = c.inst.items.len + 1;
+            c.inst.items[start_idx].alt = @intCast(c.inst.items.len + 1);
             try c.split(start_idx, c.inst.items.len + 1);
             c.next();
         },
@@ -115,11 +118,11 @@ fn compileAlternation(c: *Compiler) !void {
     try c.split(split_idx + 1, 0); // alt to be patched
     try c.compileConcat();
     if (c.cursor < c.raw.len and c.peek() == '|') {
-        c.inst.items[split_idx].alt = c.inst.items.len;
+        c.inst.items[split_idx].alt = @intCast(c.inst.items.len);
         c.next();
         const last_alt = c.inst.items.len - 1;
         try c.compileAlternation();
-        c.inst.items[last_alt].next = c.inst.items.len;
+        c.inst.items[last_alt].next = @intCast(c.inst.items.len);
     }
 }
 
@@ -134,17 +137,18 @@ inline fn next(c: *Compiler) void {
 inline fn split(c: *Compiler, next_idx: usize, alt_idx: usize) !void {
     try c.inst.append(.{
         .op = .split,
-        .next = next_idx,
-        .alt = alt_idx,
+        .next = @intCast(next_idx),
+        .alt = @intCast(alt_idx),
     });
 }
 
 inline fn matchChar(c: *Compiler, m: Pattern, next_idx: usize, alt_idx: usize) !void {
     try c.inst.append(.{
-        .op = .{ .match = m },
-        .next = next_idx,
-        .alt = alt_idx,
+        .op = .{ .match = @intCast(c.patterns.items.len) },
+        .next = @intCast(next_idx),
+        .alt = @intCast(alt_idx),
     });
+    try c.patterns.append(m);
 }
 
 fn escapedChar(c: *Compiler) !void {
@@ -174,18 +178,15 @@ fn charRange(c: *Compiler) !void {
         return c.matchChar(.{ .char = '-' }, c.inst.items.len + 1, 0);
 
     c.next(); // consume the 'to' char
-    const from_inst = &c.inst.items[c.inst.items.len - 1];
-    const from: u8 = blk: switch (from_inst.op) {
-        .match => |m| switch (m) {
-            .char => |char| break :blk char,
-            else => return error.InvalidCharRange,
-        },
+    const from_pattern = &c.patterns.items[c.patterns.items.len - 1];
+    const from: u8 = blk: switch (from_pattern.*) {
+        .char => |char| break :blk char,
         else => return error.InvalidCharRange,
     };
 
     if (from > to) return error.InvalidCharRange;
 
-    from_inst.op = .{ .match = .{ .range = .{ .from = from, .to = to } } };
+    from_pattern.* = .{ .range = .{ .from = from, .to = to } };
 }
 
 fn charGroup(c: *Compiler) !void {
@@ -205,8 +206,8 @@ fn charGroup(c: *Compiler) !void {
         try c.compileAtom(true);
     } else return error.MissingBracket;
 
-    const group_next = c.inst.items.len;
-    var i = start;
+    const group_next: u32 = @intCast(c.inst.items.len);
+    var i: u32 = @intCast(start);
     if (!negated) {
         // patch each inst
         while (i < group_next) : (i += 1) {
@@ -224,11 +225,7 @@ fn charGroup(c: *Compiler) !void {
         }
         // at last inst, if not matched then none of the negative patterns matched
         // add inst to consume current input char (which last inst is pointing to)
-        try c.inst.append(.{
-            .op = .{ .match = .{ .func = &isAny } },
-            .next = group_next + 1,
-            .alt = 0,
-        });
+        try c.matchChar(.{ .func = &isAny }, group_next + 1, 0);
     }
 }
 
@@ -239,7 +236,7 @@ fn captureGroup(c: *Compiler) !void {
 
     try c.inst.append(.{
         .op = .{ .group_start = group_num },
-        .next = c.inst.items.len + 1,
+        .next = @intCast(c.inst.items.len + 1),
     });
     try c.compileAlternation();
 
@@ -249,21 +246,21 @@ fn captureGroup(c: *Compiler) !void {
 
     try c.inst.append(.{
         .op = .{ .group_end = group_num },
-        .next = c.inst.items.len + 1,
+        .next = @intCast(c.inst.items.len + 1),
     });
 }
 
 fn backref(c: *Compiler) !void {
     const num_start = c.cursor;
     while (c.cursor < c.raw.len and isDigit(c.peek())) : (c.cursor += 1) {}
-    const num = std.fmt.parseInt(usize, c.raw[num_start..c.cursor], 10) catch
+    const num = std.fmt.parseInt(u32, c.raw[num_start..c.cursor], 10) catch
         return error.InvalidBackReference;
     if (num > c.group_count) return error.InvalidBackReference;
 
     // to account for the automatic next() at the end of escapedChar()
     c.cursor -= 1;
 
-    try c.inst.append(.{ .op = .{ .backref = num }, .next = c.inst.items.len + 1 });
+    try c.inst.append(.{ .op = .{ .backref = num }, .next = @intCast(c.inst.items.len + 1) });
 }
 
 pub const Anchors = struct {
@@ -309,44 +306,20 @@ fn isAny(_: u8) bool {
 }
 
 pub const Inst = struct {
-    /// match the patterns at idx..idx+len
     op: Op,
-    next: usize,
-    alt: usize = 0,
+    next: u32,
+    alt: u32 = 0,
 
     const Op = union(enum) {
-        match: Pattern,
+        // match patterns[idx]
+        match: u32,
         nil,
         end,
         split,
         // group number of the capture text
-        group_start: usize,
-        group_end: usize,
+        group_start: u32,
+        group_end: u32,
         // group number to reference
-        backref: usize,
+        backref: u32,
     };
-
-    pub fn format(
-        self: @This(),
-        comptime _: []const u8,
-        _: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
-        switch (self.op) {
-            .match => |p| {
-                switch (p) {
-                    .char => |c| try writer.print("char = '{c}'    ", .{c}),
-                    .func => |f| try writer.print("func = {*}", .{f}),
-                    .range => |r| try writer.print("match from '{c}' to '{c}' ", .{ r.from, r.to }),
-                }
-            },
-            .nil => try writer.print("nil           ", .{}),
-            .split => try writer.print("split         ", .{}),
-            .end => try writer.print("end           ", .{}),
-            .group_start => |g| try writer.print("grp_start = {d:<2}", .{g}),
-            .group_end => |g| try writer.print("grp_end = {d:<2}  ", .{g}),
-            .backref => |g| try writer.print("backref = {d:<2}  ", .{g}),
-        }
-        try writer.print(", next = {d:<4}, alt = {d:<4}", .{ self.next, self.alt });
-    }
 };
