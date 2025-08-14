@@ -49,6 +49,7 @@ pub fn compile(re: *Regex, raw: []const u8) !void {
 }
 
 pub const Options = struct {
+    global: bool = false,
     multiline: bool = false,
     ignore_case: bool = false,
 };
@@ -60,11 +61,18 @@ const Capture = struct {
     fn getString(self: Capture, input: []const u8) ?[]const u8 {
         const start = self.start orelse return null;
         const end = self.end orelse return null;
+        // when backref refers to an optional capture that was not matched,
+        // the capture was still populated by the matched route
+        // and has
+        if (end > input.len) return null;
         return input[start..end];
     }
 };
 
-const MatchState = std.ArrayList(Capture);
+const Job = struct {
+    input_idx: usize,
+    inst_idx: usize,
+};
 
 fn matchPattern(re: *Regex, pattern_idx: u32, char: u8) bool {
     const i = re.options.ignore_case;
@@ -98,88 +106,111 @@ fn isAtWordBoundary(re: *Regex, input_idx: usize) bool {
     return isWs(char) and isAn(prev) or isAn(char) and isWs(prev);
 }
 
-fn matchAt(re: *Regex, input_idx: usize, inst_idx: usize, state: *MatchState) !bool {
+fn matchAt(re: *Regex, input_index: usize) !bool {
     if (re.inst.len == 0) return true; // nothing to match
-    assert(inst_idx < re.inst.len); // all inst should never point past op.end
 
-    const inst = re.inst[inst_idx];
-    return switch (inst.op) {
-        .nil => return false,
-        .end => return true,
-        .split => {
-            // Try both paths with cloned states
-            var state_copy = try state.clone();
-            defer state_copy.deinit();
+    var jobs = std.ArrayList(Job).init(re.allocator);
+    defer jobs.deinit();
 
-            return try re.matchAt(input_idx, inst.next, state) or
-                try re.matchAt(input_idx, inst.alt, &state_copy);
-        },
-        .match => |p_idx| {
-            if (input_idx >= re.input.len) return false; // not enough input to match pattern
-            if (re.matchPattern(p_idx, re.input[input_idx])) {
-                return re.matchAt(input_idx + 1, inst.next, state);
-            }
-            return re.matchAt(input_idx, inst.alt, state);
-        },
-        .assert => |assertion| {
-            switch (assertion) {
-                .word_boundary => return if (re.isAtWordBoundary(input_idx)) re.matchAt(input_idx, inst.next, state) else false,
-                .non_word_boundary => return if (!re.isAtWordBoundary(input_idx)) re.matchAt(input_idx, inst.next, state) else false,
-                .start_line_or_string => {
-                    var is_start = false;
-                    if (input_idx == 0) {
-                        is_start = true;
-                    } else if (re.options.multiline and re.input[input_idx - 1] == '\n') {
-                        is_start = true;
-                    }
-                    if (is_start) return re.matchAt(input_idx, inst.next, state) else return false;
+    // could limit the number of capture groups to a fixed number?
+    // var state = [_]Capture{.{}} ** 99;
+    var captures = try re.allocator.alloc(Capture, re.group_count);
+    defer re.allocator.free(captures);
+
+    try jobs.append(.{ .input_idx = input_index, .inst_idx = 1 }); // first inst is always false
+
+    while (jobs.pop()) |job| {
+        var inst_idx = job.inst_idx;
+        var input_idx = job.input_idx;
+
+        while (true) {
+            const inst = re.inst[inst_idx];
+            switch (inst.op) {
+                .nil => break,
+                .end => return true,
+                .split => {
+                    inst_idx = inst.next;
+
+                    if (inst.alt != 0) // avoid adding jobs unnecessarily
+                        try jobs.append(.{ .input_idx = input_idx, .inst_idx = inst.alt });
                 },
-                .end_line_or_string => {
-                    var is_end = false;
-                    if (input_idx >= re.input.len) {
-                        is_end = true;
-                    } else if (re.options.multiline and re.input[input_idx] == '\n') {
-                        is_end = true;
+                .match => |p_idx| {
+                    if (input_idx >= re.input.len) break; // not enough input to match pattern
+                    if (re.matchPattern(p_idx, re.input[input_idx])) {
+                        input_idx += 1;
+                        inst_idx = inst.next;
+                    } else {
+                        inst_idx = inst.alt;
                     }
-                    return is_end;
+                },
+                .assert => |assertion| {
+                    switch (assertion) {
+                        .word_boundary => if (re.isAtWordBoundary(input_idx)) {
+                            inst_idx = inst.next;
+                        } else break,
+                        .non_word_boundary => if (!re.isAtWordBoundary(input_idx)) {
+                            inst_idx = inst.next;
+                        } else break,
+                        .start_line_or_string => {
+                            var is_start = false;
+                            if (input_idx == 0) {
+                                is_start = true;
+                            } else if (re.options.multiline and re.input[input_idx - 1] == '\n') {
+                                is_start = true;
+                            }
+                            if (is_start) {
+                                inst_idx = inst.next;
+                            } else break;
+                        },
+                        .end_line_or_string => {
+                            var is_end = false;
+                            if (input_idx >= re.input.len) {
+                                is_end = true;
+                            } else if (re.options.multiline and re.input[input_idx] == '\n') {
+                                is_end = true;
+                            }
+                            if (is_end) {
+                                inst_idx = inst.next;
+                            } else break;
+                        },
+                    }
+                },
+                .group_start => |group_num| {
+                    captures[group_num].start = input_idx;
+                    inst_idx = inst.next;
+                },
+                .group_end => |group_num| {
+                    assert(group_num < captures.len);
+                    captures[group_num].end = input_idx;
+                    inst_idx = inst.next;
+                },
+                .backref => |group_num| {
+                    // group_num > group_count is handled at compile step
+                    assert(group_num != 0 and group_num <= captures.len);
+
+                    // groups are 1-indexed in regex
+                    const group = captures[group_num - 1];
+                    const text = group.getString(re.input) orelse
+                        // if text == null, group_num refers to a group that was not matched
+                        break;
+                    // not enough input to match pattern
+                    if (input_idx + text.len > re.input.len) break;
+                    if (std.mem.eql(u8, text, re.input[input_idx..][0..text.len])) {
+                        input_idx = input_idx + text.len;
+                        inst_idx = inst.next;
+                    } else break;
                 },
             }
-        },
-        .group_start => |group_num| {
-            while (state.items.len <= group_num) {
-                state.appendAssumeCapacity(.{});
-            }
-            state.items[group_num].start = input_idx;
-            return try re.matchAt(input_idx, inst.next, state) or try re.matchAt(input_idx, inst.alt, state);
-        },
-        .group_end => |group_num| {
-            assert(group_num < state.items.len);
-            state.items[group_num].end = input_idx;
-            return re.matchAt(input_idx, inst.next, state);
-        },
-        .backref => |group_num| {
-            if (group_num == 0 or group_num > state.items.len) return false;
-
-            const group = &state.items[group_num - 1]; // groups are 1-indexed in regex
-            const text = group.getString(re.input) orelse
-                // if text == null, group_num refers to a group that was not matched
-                return false;
-            if (input_idx + text.len > re.input.len) return false;
-            if (std.mem.eql(u8, text, re.input[input_idx..][0..text.len])) {
-                return re.matchAt(input_idx + text.len, inst.next, state);
-            }
-            return re.matchAt(input_idx, inst.alt, state);
-        },
-    };
+        }
+    }
+    return false;
 }
 
 pub fn match(re: *Regex, input: []const u8) !bool {
     re.input = input;
 
     for (0..input.len) |i| {
-        var state = try MatchState.initCapacity(re.allocator, re.group_count);
-        defer state.deinit();
-        if (try re.matchAt(i, 1, &state)) return true;
+        if (try re.matchAt(i)) return true;
     }
 
     return false;
@@ -198,6 +229,7 @@ fn printInstructions(re: Regex) void {
                     .range => |r| print("match from '{c}' to '{c}' ", .{ r.from, r.to }),
                 }
             },
+            .assert => |a| print("assert = {s}", .{@tagName(a)}),
             .nil => print("nil           ", .{}),
             .split => print("split         ", .{}),
             .end => print("end           ", .{}),
@@ -213,26 +245,21 @@ test "match char and escaped char" {
     const expect = testing.expect;
     const gpa = testing.allocator;
 
-    const raw = "\\dab";
     const input = "0123abc";
-    var re = try Regex.init(gpa, raw);
+    var re = try Regex.init(gpa, "\\dab");
     defer re.deinit();
     try expect(try re.match(input));
 
-    const raw2 = "\\wbc";
-    try re.compile(raw2);
+    try re.compile("\\wbc");
     try expect(try re.match(input));
 
-    const raw3 = "\\";
-    try testing.expectError(error.UnexpectedEOF, re.compile(raw3));
+    try testing.expectError(error.UnexpectedEOF, re.compile("\\"));
 
     const input2 = "\x08\x0D\x0B\x0C\x0A\x1B";
-    const raw4 = "\\t\\r\\v\\f\\n\\e";
-    try re.compile(raw4);
+    try re.compile("\\t\\r\\v\\f\\n\\e");
     try expect(try re.match(input2));
 
-    const raw5 = "\\s+";
-    try re.compile(raw5);
+    try re.compile("\\s+");
     try expect(try re.match(input2));
     try expect(!try re.match("t"));
 }
@@ -241,47 +268,39 @@ test "match character group" {
     const expect = testing.expect;
     const gpa = testing.allocator;
 
-    const raw3 = "[1a] apple";
     const input3a = "1 apple";
     const input3b = "a apple";
     const input3c = "b apple";
 
-    var re = try Regex.init(gpa, raw3);
+    var re = try Regex.init(gpa, "[1a] apple");
     defer re.deinit();
     try expect(try re.match(input3a));
     try expect(try re.match(input3b));
     try expect(!try re.match(input3c));
 
-    const raw4 = "[^1a] apple";
-    try re.compile(raw4);
+    try re.compile("[^1a] apple");
     try expect(try re.match(input3c));
     try expect(!try re.match(input3a));
     try expect(!try re.match(input3b));
 
-    const raw5 = "[x-z] always me";
-    try re.compile(raw5);
+    try re.compile("[x-z] always me");
     try expect(try re.match("y always me"));
     try expect(!try re.match("b always me"));
 
-    const raw6 = "[^x-z] always me";
-    try re.compile(raw6);
+    try re.compile("[^x-z] always me");
     try expect(!try re.match("y always me"));
     try expect(try re.match("b always me"));
 
-    const raw7 = "[1-] ball";
-    try re.compile(raw7);
-    try expect(try re.match("1 ball"));
-    try expect(try re.match("- ball"));
-    const raw8 = "[-1] ball";
-    try re.compile(raw8);
+    try re.compile("[1-] ball");
     try expect(try re.match("1 ball"));
     try expect(try re.match("- ball"));
 
-    const raw9 = "[9-1] balls";
-    try testing.expectError(error.InvalidCharRange, re.compile(raw9));
+    try re.compile("[-1] ball");
+    try expect(try re.match("1 ball"));
+    try expect(try re.match("- ball"));
 
-    const raw10 = "[abc no close";
-    try testing.expectError(error.MissingBracket, re.compile(raw10));
+    try testing.expectError(error.InvalidCharRange, re.compile("[9-1] balls"));
+    try testing.expectError(error.MissingBracket, re.compile("[abc no close"));
 }
 
 test "match anchors" {
@@ -321,20 +340,17 @@ test "quantifier" {
 
     const input1 = "cats";
 
-    const raw = "ca+ts";
-    var re = try Regex.init(gpa, raw);
+    var re = try Regex.init(gpa, "ca+ts");
     defer re.deinit();
     try expect(try re.match(input1));
     try expect(try re.match("caats"));
     try expect(try re.match("caaats"));
 
-    const raw2 = "ca?ts";
-    try re.compile(raw2);
+    try re.compile("ca?ts");
     try expect(try re.match(input1));
     try expect(try re.match("cts"));
 
-    const raw3 = "ca*ts";
-    try re.compile(raw3);
+    try re.compile("ca*ts");
     try expect(try re.match("cts"));
     try expect(try re.match(input1));
     try expect(try re.match("caats"));
@@ -346,19 +362,16 @@ test "match wildcard" {
     const gpa = testing.allocator;
 
     const input = "log";
-    const raw = "l.g";
     const input1 = "lot";
-    var re = try Regex.init(gpa, raw);
+    var re = try Regex.init(gpa, "l.g");
     defer re.deinit();
     try expect(try re.match(input));
     try expect(!try re.match(input1));
 
-    const raw2 = ".og";
-    try re.compile(raw2);
+    try re.compile(".og");
     try expect(try re.match(input));
 
-    const raw3 = "lo.";
-    try re.compile(raw3);
+    try re.compile("lo.");
     try expect(try re.match(input));
 }
 
@@ -366,8 +379,7 @@ test "match groups with alternation" {
     const expect = testing.expect;
     const gpa = testing.allocator;
 
-    const raw = "(abl|cde)+123";
-    var re = try Regex.init(gpa, raw);
+    var re = try Regex.init(gpa, "(abl|cde)+123");
     defer re.deinit();
 
     try expect(try re.match("abl123"));
@@ -376,25 +388,24 @@ test "match groups with alternation" {
     try expect(!try re.match("abc123"));
     try expect(!try re.match("xyz123"));
 
-    const raw2 = "x(a|b|c)?y";
-    try re.compile(raw2);
-
+    try re.compile("x(a|b|c)?y");
     try expect(try re.match("xay"));
     try expect(try re.match("xby"));
     try expect(try re.match("xcy"));
     try expect(try re.match("xy"));
     try expect(!try re.match("xdy"));
 
-    const raw3 = "x(a|b|c?y";
-    try testing.expectError(error.MissingParen, re.compile(raw3));
+    try re.compile("^I see (\\d (cat|dog|cow)s?(, | and )?)+$");
+    try expect(try re.match("I see 1 cat, 2 dogs and 3 cows"));
+
+    try testing.expectError(error.MissingParen, re.compile("x(a|b|c?y"));
 }
 
 test "backreference" {
     const expect = testing.expect;
     const gpa = testing.allocator;
 
-    const raw = "(a|b+) \\1";
-    var re = try Regex.init(gpa, raw);
+    var re = try Regex.init(gpa, "(a|b+) \\1");
     defer re.deinit();
 
     try expect(try re.match("a a"));
@@ -404,24 +415,19 @@ test "backreference" {
     try expect(!try re.match("a b"));
     try expect(!try re.match("b a"));
 
-    const raw2 = "(\\d+) (\\w+) squares and \\1 \\2 circles";
-    try re.compile(raw2);
+    try re.compile("(\\d+) (\\w+) squares and \\1 \\2 circles");
 
     try expect(try re.match("3 red squares and 3 red circles"));
     try expect(!try re.match("3 red squares and 4 red circles"));
 
-    const raw3 = "^I see (\\d (cat|dog|cow)s?(, | and )?)+$";
-    try re.compile(raw3);
-
-    try expect(try re.match("I see 1 cat, 2 dogs and 3 cows"));
-
-    const raw4 = "(\\d+ )?(\\w+) squares and \\1\\2 circles";
-    try re.compile(raw4);
+    try re.compile("(\\d+ )?(\\w+) squares and \\1\\2 circles");
     try expect(try re.match("3 red squares and 3 red circles"));
     try expect(!try re.match("red squares and red circles"));
 
-    const raw5 = "\\d+ (\\w+) squares and \\1\\2 circles";
-    try testing.expectError(error.InvalidBackReference, re.compile(raw5));
+    try testing.expectError(
+        error.InvalidBackReference,
+        re.compile("\\d+ (\\w+) squares and \\1\\2 circles"),
+    );
 }
 
 test "options" {

@@ -154,9 +154,9 @@ inline fn instMatch(c: *Compiler, m: Pattern, next_idx: usize, alt_idx: usize) !
     try c.patterns.append(m);
 }
 
-inline fn instAssert(c: *Compiler, anchor: Inst.Anchor) !void {
+inline fn instAssert(c: *Compiler, assert: Inst.Assertion) !void {
     try c.inst.append(.{
-        .op = .{ .assert = anchor },
+        .op = .{ .assert = assert },
         .next = @intCast(c.inst.items.len + 1),
     });
 }
@@ -262,6 +262,7 @@ fn captureGroup(c: *Compiler) !void {
     const group_num = c.group_count;
     c.group_count += 1;
 
+    try c.split(c.inst.items.len + 1, 0);
     try c.inst.append(.{
         .op = .{ .group_start = group_num },
         .next = @intCast(c.inst.items.len + 1),
@@ -327,6 +328,7 @@ fn isAny(_: u8) bool {
     return true;
 }
 
+// TODO: move alt to split, remove next
 pub const Inst = struct {
     op: Op,
     next: u32,
@@ -335,7 +337,7 @@ pub const Inst = struct {
     const Op = union(enum) {
         // match patterns[idx]
         match: u32,
-        assert: Anchor,
+        assert: Assertion,
         nil,
         end,
         split,
@@ -346,7 +348,7 @@ pub const Inst = struct {
         backref: u32,
     };
 
-    const Anchor = enum {
+    const Assertion = enum {
         start_line_or_string,
         end_line_or_string,
         word_boundary,
