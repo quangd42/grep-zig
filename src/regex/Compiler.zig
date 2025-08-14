@@ -21,7 +21,6 @@ inst: std.ArrayList(Inst),
 patterns: std.ArrayList(Pattern),
 cursor: u32 = 0,
 group_count: u32 = 0,
-anchors: Anchors = .{ .start = false, .end = false },
 
 pub fn init(gpa: Allocator, raw: []const u8) Compiler {
     return .{
@@ -39,10 +38,6 @@ pub fn deinit(c: *Compiler) void {
 pub fn compile(c: *Compiler) !void {
     // reserving first inst as nil
     try c.inst.append(.{ .op = .nil, .next = 0 });
-    if (c.raw[c.cursor] == '^') {
-        c.anchors.start = true;
-        c.cursor += 1;
-    }
 
     try c.compileAlternation();
 
@@ -56,28 +51,34 @@ fn compileAtom(c: *Compiler, in_char_group: bool) Error!void {
         '\\' => try c.escapedChar(),
         '[' => try c.charGroup(),
         '.' => {
-            try c.matchChar(.{ .func = &isAny }, c.inst.items.len + 1, 0);
+            try c.instMatch(.{ .func = &isAny }, c.inst.items.len + 1, 0);
             c.next();
         },
         '(' => try c.captureGroup(),
         '-' => {
             if (!in_char_group) {
-                try c.matchChar(.{ .char = c.peek() }, c.inst.items.len + 1, 0);
+                try c.instMatch(.{ .char = c.peek() }, c.inst.items.len + 1, 0);
                 return c.next();
             }
 
             try c.charRange();
         },
+        '^' => {
+            if (c.cursor == 0) {
+                try c.instAssert(.start_line_or_string);
+            } else return error.UnsupportedClass;
+            c.next();
+        },
         '$' => {
             if (c.cursor == c.raw.len - 1) {
-                c.anchors.end = true;
+                try c.instAssert(.end_line_or_string);
             } else return error.UnsupportedClass;
             c.next();
         },
         '+', '?', '*' => return error.MissingRepeatArgument,
         '|', ')' => unreachable,
         else => {
-            try c.matchChar(.{ .char = c.peek() }, c.inst.items.len + 1, 0);
+            try c.instMatch(.{ .char = c.peek() }, c.inst.items.len + 1, 0);
             return c.next();
         },
     }
@@ -144,7 +145,7 @@ inline fn split(c: *Compiler, next_idx: usize, alt_idx: usize) !void {
     });
 }
 
-inline fn matchChar(c: *Compiler, m: Pattern, next_idx: usize, alt_idx: usize) !void {
+inline fn instMatch(c: *Compiler, m: Pattern, next_idx: usize, alt_idx: usize) !void {
     try c.inst.append(.{
         .op = .{ .match = @intCast(c.patterns.items.len) },
         .next = @intCast(next_idx),
@@ -153,22 +154,40 @@ inline fn matchChar(c: *Compiler, m: Pattern, next_idx: usize, alt_idx: usize) !
     try c.patterns.append(m);
 }
 
+inline fn instAssert(c: *Compiler, anchor: Inst.Anchor) !void {
+    try c.inst.append(.{
+        .op = .{ .assert = anchor },
+        .next = @intCast(c.inst.items.len + 1),
+    });
+}
+
 fn escapedChar(c: *Compiler) !void {
     if (c.cursor + 1 >= c.raw.len) return error.UnexpectedEOF;
     c.next();
     const next_inst = c.inst.items.len + 1;
     switch (c.peek()) {
-        'd' => try c.matchChar(.{ .func = &isDigit }, next_inst, 0),
-        'w' => try c.matchChar(.{ .func = &isAlphanumeric }, next_inst, 0),
-        't' => try c.matchChar(.{ .char = cc.bs }, next_inst, 0),
-        'r' => try c.matchChar(.{ .char = cc.cr }, next_inst, 0),
-        'v' => try c.matchChar(.{ .char = cc.vt }, next_inst, 0),
-        'f' => try c.matchChar(.{ .char = cc.ff }, next_inst, 0),
-        'n' => try c.matchChar(.{ .char = cc.lf }, next_inst, 0),
-        'e' => try c.matchChar(.{ .char = cc.esc }, next_inst, 0),
-        's' => try c.matchChar(.{ .func = &isWhitespace }, next_inst, 0),
-        '-', '|', '*', '+', '?', '(', ')' => |ch| try c.matchChar(.{ .char = ch }, next_inst, 0),
+        // char class
+        'd' => try c.instMatch(.{ .func = &isDigit }, next_inst, 0),
+        'w' => try c.instMatch(.{ .func = &isAlphanumeric }, next_inst, 0),
+
+        // white space
+        't' => try c.instMatch(.{ .char = cc.bs }, next_inst, 0),
+        'r' => try c.instMatch(.{ .char = cc.cr }, next_inst, 0),
+        'v' => try c.instMatch(.{ .char = cc.vt }, next_inst, 0),
+        'f' => try c.instMatch(.{ .char = cc.ff }, next_inst, 0),
+        'n' => try c.instMatch(.{ .char = cc.lf }, next_inst, 0),
+        'e' => try c.instMatch(.{ .char = cc.esc }, next_inst, 0),
+        's' => try c.instMatch(.{ .func = &isWhitespace }, next_inst, 0),
+
+        // escaped
+        '-', '|', '*', '+', '?', '(', ')' => |ch| try c.instMatch(.{ .char = ch }, next_inst, 0),
+
+        // backref
         '1'...'9' => try c.backref(),
+
+        // anchor
+        'b' => try c.instAssert(.word_boundary),
+        'B' => try c.instAssert(.non_word_boundary),
         else => return error.UnexpectedEOF,
     }
     c.next();
@@ -184,7 +203,7 @@ fn charRange(c: *Compiler) !void {
     if (prev == '[' or
         (prev == '^' and c.raw[c.cursor - 3] == '[') or // safe because in_char_group == true
         to == ']')
-        return c.matchChar(.{ .char = '-' }, c.inst.items.len + 1, 0);
+        return c.instMatch(.{ .char = '-' }, c.inst.items.len + 1, 0);
 
     c.next(); // consume the 'to' char
     const from_pattern = &c.patterns.items[c.patterns.items.len - 1];
@@ -234,7 +253,7 @@ fn charGroup(c: *Compiler) !void {
         }
         // at last inst, if not matched then none of the negative patterns matched
         // add inst to consume current input char (which last inst is pointing to)
-        try c.matchChar(.{ .func = &isAny }, group_next + 1, 0);
+        try c.instMatch(.{ .func = &isAny }, group_next + 1, 0);
     }
 }
 
@@ -272,11 +291,6 @@ fn backref(c: *Compiler) !void {
     try c.inst.append(.{ .op = .{ .backref = num }, .next = @intCast(c.inst.items.len + 1) });
 }
 
-pub const Anchors = struct {
-    start: bool,
-    end: bool,
-};
-
 pub const Pattern = union(enum) {
     char: u8,
     range: Range,
@@ -303,14 +317,14 @@ fn isDigit(c: u8) bool {
     };
 }
 
-fn isAlphanumeric(c: u8) bool {
+pub fn isAlphanumeric(c: u8) bool {
     return switch (c) {
         '0'...'9', 'A'...'Z', 'a'...'z', '_' => true,
         else => false,
     };
 }
 
-fn isWhitespace(c: u8) bool {
+pub fn isWhitespace(c: u8) bool {
     return switch (c) {
         ' ', '\t'...'\r' => true,
         else => false,
@@ -329,6 +343,7 @@ pub const Inst = struct {
     const Op = union(enum) {
         // match patterns[idx]
         match: u32,
+        assert: Anchor,
         nil,
         end,
         split,
@@ -337,5 +352,12 @@ pub const Inst = struct {
         group_end: u32,
         // group number to reference
         backref: u32,
+    };
+
+    const Anchor = enum {
+        start_line_or_string,
+        end_line_or_string,
+        word_boundary,
+        non_word_boundary,
     };
 };

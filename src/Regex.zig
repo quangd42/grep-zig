@@ -12,7 +12,6 @@ allocator: Allocator,
 
 inst: []Compiler.Inst,
 patterns: []Compiler.Pattern,
-anchors: Compiler.Anchors,
 group_count: usize,
 
 pub fn init(gpa: Allocator, raw: []const u8) !Regex {
@@ -22,7 +21,6 @@ pub fn init(gpa: Allocator, raw: []const u8) !Regex {
     return Regex{
         .inst = try compiler.inst.toOwnedSlice(),
         .patterns = try compiler.patterns.toOwnedSlice(),
-        .anchors = compiler.anchors,
         .group_count = compiler.group_count,
         .allocator = gpa,
     };
@@ -40,7 +38,6 @@ pub fn compile(re: *Regex, raw: []const u8) !void {
     re.deinit();
     re.inst = try compiler.inst.toOwnedSlice();
     re.patterns = try compiler.patterns.toOwnedSlice();
-    re.anchors = compiler.anchors;
     re.group_count = compiler.group_count;
 }
 
@@ -57,6 +54,19 @@ const Capture = struct {
 
 const MatchState = std.ArrayList(Capture);
 
+fn isAtWordBoundary(re: *Regex, input_idx: usize) bool {
+    const isAn = Compiler.isAlphanumeric;
+    const isWs = Compiler.isWhitespace;
+
+    if (input_idx >= re.input.len) return isAn(re.input[input_idx - 1]);
+    const char = re.input[input_idx];
+
+    if (input_idx < 1) return isAn(char);
+    const prev = re.input[input_idx - 1];
+
+    return isWs(char) and isAn(prev) or isAn(char) and isWs(prev);
+}
+
 fn matchAt(re: *Regex, input_idx: usize, inst_idx: usize, state: *MatchState) !bool {
     if (re.inst.len == 0) return true; // nothing to match
     assert(inst_idx < re.inst.len); // all inst should never point past op.end
@@ -64,10 +74,7 @@ fn matchAt(re: *Regex, input_idx: usize, inst_idx: usize, state: *MatchState) !b
     const inst = re.inst[inst_idx];
     return switch (inst.op) {
         .nil => return false,
-        .end => {
-            if (re.anchors.end and input_idx != re.input.len) return false;
-            return true;
-        },
+        .end => return true,
         .split => {
             // Try both paths with cloned states
             var state_copy = try state.clone();
@@ -82,6 +89,22 @@ fn matchAt(re: *Regex, input_idx: usize, inst_idx: usize, state: *MatchState) !b
                 return try re.matchAt(input_idx + 1, inst.next, state);
             }
             return try re.matchAt(input_idx, inst.alt, state);
+        },
+        .assert => |assertion| {
+            switch (assertion) {
+                .word_boundary => return if (re.isAtWordBoundary(input_idx)) re.matchAt(input_idx, inst.next, state) else false,
+                .non_word_boundary => return if (!re.isAtWordBoundary(input_idx)) re.matchAt(input_idx, inst.next, state) else false,
+                .start_line_or_string => {
+                    if (input_idx == 0 or re.input[input_idx - 1] == '\n')
+                        return re.matchAt(input_idx, inst.next, state);
+                    return false;
+                },
+                .end_line_or_string => {
+                    if (input_idx >= re.input.len or re.input[input_idx] == '\n')
+                        return true;
+                    return false;
+                },
+            }
         },
         .group_start => |group_num| {
             while (state.items.len <= group_num) {
@@ -113,9 +136,8 @@ fn matchAt(re: *Regex, input_idx: usize, inst_idx: usize, state: *MatchState) !b
 
 pub fn match(re: *Regex, input: []const u8) !bool {
     re.input = input;
-    const match_range = if (re.anchors.start) 1 else input.len;
 
-    for (0..match_range) |i| {
+    for (0..input.len) |i| {
         var state = try MatchState.initCapacity(re.allocator, re.group_count);
         defer state.deinit();
         if (try re.matchAt(i, 1, &state)) return true;
@@ -229,16 +251,29 @@ test "match anchors" {
 
     const long = "logloglog";
     const short = "log";
+    const multiline1 = "log this\nand other log";
+    const multiline2 = "something\nlog some other log\nand done";
     const raw5 = "^log";
     var re = try Regex.init(gpa, raw5);
     defer re.deinit();
     try expect(try re.match(short));
     try expect(try re.match(long));
+    try expect(try re.match(multiline1));
+    try expect(try re.match(multiline2));
 
-    const raw6 = "log$";
-    try re.compile(raw6);
+    // end of string
+    try re.compile("log$");
     try expect(try re.match(short));
     try expect(try re.match(long));
+    try expect(try re.match(multiline1));
+    try expect(try re.match(multiline2));
+
+    try re.compile("\\bare\\w*\\b");
+    try expect(try re.match("area bare arena mare"));
+
+    // non_word_boundary
+    try re.compile("\\Bqu\\w+");
+    try expect(try re.match("equity queen equip acquaint quiet"));
 }
 
 test "quantifier" {
