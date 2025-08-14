@@ -300,14 +300,6 @@ pub const Pattern = union(enum) {
         from: u8,
         to: u8,
     };
-
-    pub fn match(s: Pattern, char: u8) bool {
-        return switch (s) {
-            .char => |c| char == c,
-            .range => |r| r.from <= char and r.to >= char,
-            .func => |f| f(char),
-        };
-    }
 };
 
 fn isDigit(c: u8) bool {

@@ -2,12 +2,14 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
 const assert = std.debug.assert;
+const ascii = std.ascii;
 
 const Compiler = @import("regex/Compiler.zig");
 
 const Regex = @This();
 
 input: []const u8 = &[_]u8{},
+options: Options,
 allocator: Allocator,
 
 inst: []Compiler.Inst,
@@ -15,10 +17,15 @@ patterns: []Compiler.Pattern,
 group_count: usize,
 
 pub fn init(gpa: Allocator, raw: []const u8) !Regex {
+    return initWithOptions(gpa, raw, Options{});
+}
+
+pub fn initWithOptions(gpa: Allocator, raw: []const u8, options: Options) !Regex {
     var compiler = Compiler.init(gpa, raw);
     defer compiler.deinit();
     try compiler.compile();
     return Regex{
+        .options = options,
         .inst = try compiler.inst.toOwnedSlice(),
         .patterns = try compiler.patterns.toOwnedSlice(),
         .group_count = compiler.group_count,
@@ -41,6 +48,11 @@ pub fn compile(re: *Regex, raw: []const u8) !void {
     re.group_count = compiler.group_count;
 }
 
+pub const Options = struct {
+    multiline: bool = false,
+    ignore_case: bool = false,
+};
+
 const Capture = struct {
     start: ?usize = null,
     end: ?usize = null,
@@ -53,6 +65,25 @@ const Capture = struct {
 };
 
 const MatchState = std.ArrayList(Capture);
+
+fn matchPattern(re: *Regex, pattern_idx: u32, char: u8) bool {
+    const i = re.options.ignore_case;
+    const p = re.patterns[pattern_idx];
+    return switch (p) {
+        .char => |c| {
+            const target = if (i) ascii.toLower(char) else char;
+            const pattern = if (i) ascii.toLower(c) else c;
+            return pattern == target;
+        },
+        .range => |r| {
+            const target = if (i) ascii.toLower(char) else char;
+            const p_from = if (i) ascii.toLower(r.from) else r.from;
+            const p_to = if (i) ascii.toLower(r.to) else r.to;
+            return p_from <= target and p_to >= target;
+        },
+        .func => |f| f(char),
+    };
+}
 
 fn isAtWordBoundary(re: *Regex, input_idx: usize) bool {
     const isAn = Compiler.isAlphanumeric;
@@ -85,24 +116,32 @@ fn matchAt(re: *Regex, input_idx: usize, inst_idx: usize, state: *MatchState) !b
         },
         .match => |p_idx| {
             if (input_idx >= re.input.len) return false; // not enough input to match pattern
-            if (re.patterns[p_idx].match(re.input[input_idx])) {
-                return try re.matchAt(input_idx + 1, inst.next, state);
+            if (re.matchPattern(p_idx, re.input[input_idx])) {
+                return re.matchAt(input_idx + 1, inst.next, state);
             }
-            return try re.matchAt(input_idx, inst.alt, state);
+            return re.matchAt(input_idx, inst.alt, state);
         },
         .assert => |assertion| {
             switch (assertion) {
                 .word_boundary => return if (re.isAtWordBoundary(input_idx)) re.matchAt(input_idx, inst.next, state) else false,
                 .non_word_boundary => return if (!re.isAtWordBoundary(input_idx)) re.matchAt(input_idx, inst.next, state) else false,
                 .start_line_or_string => {
-                    if (input_idx == 0 or re.input[input_idx - 1] == '\n')
-                        return re.matchAt(input_idx, inst.next, state);
-                    return false;
+                    var is_start = false;
+                    if (input_idx == 0) {
+                        is_start = true;
+                    } else if (re.options.multiline and re.input[input_idx - 1] == '\n') {
+                        is_start = true;
+                    }
+                    if (is_start) return re.matchAt(input_idx, inst.next, state) else return false;
                 },
                 .end_line_or_string => {
-                    if (input_idx >= re.input.len or re.input[input_idx] == '\n')
-                        return true;
-                    return false;
+                    var is_end = false;
+                    if (input_idx >= re.input.len) {
+                        is_end = true;
+                    } else if (re.options.multiline and re.input[input_idx] == '\n') {
+                        is_end = true;
+                    }
+                    return is_end;
                 },
             }
         },
@@ -116,7 +155,7 @@ fn matchAt(re: *Regex, input_idx: usize, inst_idx: usize, state: *MatchState) !b
         .group_end => |group_num| {
             assert(group_num < state.items.len);
             state.items[group_num].end = input_idx;
-            return try re.matchAt(input_idx, inst.next, state);
+            return re.matchAt(input_idx, inst.next, state);
         },
         .backref => |group_num| {
             if (group_num == 0 or group_num > state.items.len) return false;
@@ -127,9 +166,9 @@ fn matchAt(re: *Regex, input_idx: usize, inst_idx: usize, state: *MatchState) !b
                 return false;
             if (input_idx + text.len > re.input.len) return false;
             if (std.mem.eql(u8, text, re.input[input_idx..][0..text.len])) {
-                return try re.matchAt(input_idx + text.len, inst.next, state);
+                return re.matchAt(input_idx + text.len, inst.next, state);
             }
-            return try re.matchAt(input_idx, inst.alt, state);
+            return re.matchAt(input_idx, inst.alt, state);
         },
     };
 }
@@ -253,10 +292,10 @@ test "match anchors" {
     const short = "log";
     const multiline1 = "log this\nand other log";
     const multiline2 = "something\nlog some other log\nand done";
-    const raw5 = "^log";
-    var re = try Regex.init(gpa, raw5);
+    var re = try Regex.initWithOptions(gpa, "^log", .{ .multiline = true });
     defer re.deinit();
     try expect(try re.match(short));
+    try expect(!try re.match("LOG"));
     try expect(try re.match(long));
     try expect(try re.match(multiline1));
     try expect(try re.match(multiline2));
@@ -383,4 +422,28 @@ test "backreference" {
 
     const raw5 = "\\d+ (\\w+) squares and \\1\\2 circles";
     try testing.expectError(error.InvalidBackReference, re.compile(raw5));
+}
+
+test "options" {
+    const gpa = testing.allocator;
+    const expect = testing.expect;
+
+    // multiline
+    const string = "log this\nand other log";
+    const line = "something\nlog some other log\nand done";
+
+    var re = try Regex.initWithOptions(gpa, "^log", .{ .multiline = true });
+    defer re.deinit();
+    try expect(try re.match(string));
+    try expect(try re.match(line));
+
+    try re.compile("log$");
+    try expect(try re.match(string));
+    try expect(try re.match(line));
+
+    // ignore case
+    re.deinit();
+    re = try Regex.initWithOptions(gpa, "log \\w+", .{ .ignore_case = true });
+    try expect(try re.match("log this"));
+    try expect(try re.match("LOG this"));
 }
